@@ -84,6 +84,133 @@ internal static class RustSettings
     }
 }
 
+// Локализация меню: английский по умолчанию, русский при русском языке игры.
+internal static class RustText
+{
+    private static bool? isRussian;
+
+    public static bool Russian
+    {
+        get
+        {
+            if (!isRussian.HasValue)
+            {
+                isRussian = DetectRussian();
+            }
+            return isRussian.Value;
+        }
+    }
+
+    public static string T(string en, string ru)
+    {
+        return Russian ? ru : en;
+    }
+
+    private static bool DetectRussian()
+    {
+        try
+        {
+            string value = ReadLanguage();
+            if (!string.IsNullOrEmpty(value))
+            {
+                value = value.Trim().ToLowerInvariant();
+                if (value.StartsWith("ru") || value.Contains("russ")) return true;
+                if (value.StartsWith("en") || value.Contains("english")) return false;
+                return false;
+            }
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            return Application.systemLanguage == SystemLanguage.Russian;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string ReadLanguage()
+    {
+        try
+        {
+            Type loc = FindType("Localization");
+            if (loc != null)
+            {
+                PropertyInfo prop = loc.GetProperty("ActiveLanguage",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                if (prop != null)
+                {
+                    string s = prop.GetValue(null, null) as string;
+                    if (!string.IsNullOrEmpty(s)) return s;
+                }
+
+                FieldInfo field = loc.GetField("ActiveLanguage",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                if (field != null)
+                {
+                    string s = field.GetValue(null) as string;
+                    if (!string.IsNullOrEmpty(s)) return s;
+                }
+
+                MethodInfo method = loc.GetMethod("GetCurrentGameLanguage",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                if (method != null && method.GetParameters().Length == 0)
+                {
+                    string s = method.Invoke(null, null) as string;
+                    if (!string.IsNullOrEmpty(s)) return s;
+                }
+            }
+
+            Type prefs = FindType("GamePrefs");
+            Type prefEnum = FindType("EnumGamePrefs");
+            if (prefs != null && prefEnum != null)
+            {
+                object key = null;
+                try { key = Enum.Parse(prefEnum, "OptionsLanguage"); }
+                catch { }
+
+                if (key != null)
+                {
+                    MethodInfo getter = prefs.GetMethod("GetString",
+                        BindingFlags.Public | BindingFlags.Static, null,
+                        new Type[] { prefEnum }, null);
+                    if (getter != null)
+                    {
+                        string s = getter.Invoke(null, new object[] { key }) as string;
+                        if (!string.IsNullOrEmpty(s)) return s;
+                    }
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        return null;
+    }
+
+    private static Type FindType(string name)
+    {
+        Type t = Type.GetType(name + ", Assembly-CSharp");
+        if (t != null) return t;
+
+        try
+        {
+            Assembly asm = Assembly.GetAssembly(typeof(GameManager));
+            if (asm != null) return asm.GetType(name);
+        }
+        catch
+        {
+        }
+
+        return null;
+    }
+}
+
 internal static class RustLighting
 {
     private const float DuskStart = 20f;  // 20:00
@@ -159,16 +286,16 @@ internal static class RustLighting
     // Название текущего режима для меню.
     public static string ModeName()
     {
-        if (!RustSettings.Enabled) return "выключено";
-        if (DemoActive) return "демо-ночь";
+        if (!RustSettings.Enabled) return RustText.T("off", "выключено");
+        if (DemoActive) return RustText.T("demo night", "демо-ночь");
 
         float clock = GetClock();
         if (clock < 0f) return "—";
 
-        if (clock >= DuskStart && clock < NightStart) return "закат";
-        if (clock >= NightStart || clock < DawnStart) return "ночь";
-        if (clock >= DawnStart && clock < DayStart) return "рассвет";
-        return "день";
+        if (clock >= DuskStart && clock < NightStart) return RustText.T("dusk", "закат");
+        if (clock >= NightStart || clock < DawnStart) return RustText.T("night", "ночь");
+        if (clock >= DawnStart && clock < DayStart) return RustText.T("dawn", "рассвет");
+        return RustText.T("day", "день");
     }
 }
 
@@ -295,7 +422,7 @@ public class DifMenuBehaviour : MonoBehaviour
     }
 
     private bool open;
-    private Rect windowRect = new Rect(70f, 70f, 440f, 340f);
+    private Rect windowRect = new Rect(70f, 70f, 460f, 340f);
 
     private Texture2D panelTex;
     private Texture2D accentTex;
@@ -407,7 +534,7 @@ public class DifMenuBehaviour : MonoBehaviour
             RustSettings.Enabled = GUI.Toggle(
                 new Rect(18f, y, w - 36f, 24f),
                 RustSettings.Enabled,
-                "  Затемнение включено",
+                RustText.T("  Darkening enabled", "  Затемнение включено"),
                 toggleStyle
             );
             if (was != RustSettings.Enabled) RustSettings.Save();
@@ -416,7 +543,7 @@ public class DifMenuBehaviour : MonoBehaviour
         y += 34f;
 
         GUI.enabled = RustSettings.Enabled;
-        GUI.Label(new Rect(18f, y, w - 130f, 20f), "Сила тьмы", labelStyle);
+        GUI.Label(new Rect(18f, y, w - 130f, 20f), RustText.T("Darkness", "Сила тьмы"), labelStyle);
         GUI.Label(new Rect(w - 110f, y, 92f, 20f),
             Mathf.RoundToInt(RustSettings.NightFactorValue * 100f) + "%", valueStyle);
 
@@ -437,19 +564,22 @@ public class DifMenuBehaviour : MonoBehaviour
         y += 46f;
 
         GUI.Label(new Rect(18f, y, w - 36f, 20f),
-            "Меньше — темнее. 6% — почти полная тьма, 30% — мягкая ночь.",
+            RustText.T(
+                "Lower is darker. 6% = almost pitch black, 30% = soft night.",
+                "Меньше — темнее. 6% — почти полная тьма, 30% — мягкая ночь."),
             hintStyle);
         y += 26f;
 
-        if (GUI.Button(new Rect(18f, y, 168f, 30f), "Ночь сейчас (30 с)", buttonStyle))
+        if (GUI.Button(new Rect(18f, y, 180f, 30f),
+            RustText.T("Night now (30 s)", "Ночь сейчас (30 с)"), buttonStyle))
         {
             RustLighting.ForceNight(30f);
         }
-        if (GUI.Button(new Rect(196f, y, 96f, 30f), "Сбросить", buttonStyle))
+        if (GUI.Button(new Rect(206f, y, 90f, 30f), RustText.T("Reset", "Сбросить"), buttonStyle))
         {
             RustSettings.Reset();
         }
-        if (GUI.Button(new Rect(302f, y, w - 320f, 30f), "Закрыть", buttonStyle))
+        if (GUI.Button(new Rect(304f, y, w - 322f, 30f), RustText.T("Close", "Закрыть"), buttonStyle))
         {
             Close();
             return;
@@ -466,12 +596,15 @@ public class DifMenuBehaviour : MonoBehaviour
                 Mathf.FloorToInt((clock - Mathf.Floor(clock)) * 60f));
 
         string demo = RustLighting.DemoActive
-            ? string.Format("  ·  демо {0} с", Mathf.CeilToInt(RustLighting.DemoRemaining))
+            ? string.Format(RustText.T("  ·  demo {0} s", "  ·  демо {0} с"),
+                Mathf.CeilToInt(RustLighting.DemoRemaining))
             : "";
 
         GUI.Label(
             new Rect(18f, y, w - 36f, 40f),
-            string.Format("Режим: {0}  ·  время {1}  ·  тьма {2}%{3}",
+            string.Format(
+                RustText.T("Mode: {0}  ·  time {1}  ·  darkness {2}%{3}",
+                           "Режим: {0}  ·  время {1}  ·  тьма {2}%{3}"),
                 RustLighting.ModeName(),
                 clockText,
                 Mathf.RoundToInt(RustLighting.GetFactor() * 100f),
@@ -481,7 +614,7 @@ public class DifMenuBehaviour : MonoBehaviour
 
         y += 34f;
         GUI.Label(new Rect(18f, y, w - 36f, 20f),
-            "NumPad6 / F8 — открыть меню", hintStyle);
+            RustText.T("NumPad6 / F8 = open menu", "NumPad6 / F8 — открыть меню"), hintStyle);
 
         GUI.DragWindow(new Rect(0f, 0f, w, 40f));
     }

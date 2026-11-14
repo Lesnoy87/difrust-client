@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.0
+
+- The settings menu now follows the game language: English by default, Russian
+  when the game runs in Russian. Language is detected at runtime, no restart needed.
+- Wider menu window so the English labels fit.
+- Button row re-spaced for both languages.
+
 ## 1.1.0
 
 - In-game settings menu (NumPad6 / F8): on/off, darkness slider, night preview, reset.

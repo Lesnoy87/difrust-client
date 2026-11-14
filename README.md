@@ -22,6 +22,10 @@ Press **NumPad6** or **F8**:
 - "Night now (30 s)" — preview without waiting for 22:00;
 - reset to defaults.
 
+The menu follows the game language: English by default, Russian when the game runs
+in Russian. The language is detected at runtime, so no restart or manual switch is
+needed.
+
 Settings are stored in `DifRUST.cfg` next to the game's save data
 (`Application.persistentDataPath`) and restored on launch:
 

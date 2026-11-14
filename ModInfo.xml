@@ -1,10 +1,10 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <xml>
   <Name value="DifRUST" />
   <DisplayName value="DifRUST - Rust Nights" />
   <Description value="Rust-style nights: gradual dusk 20:00, full darkness 22:00-04:00, dawn 04:00-06:00. Menu NumPad6/F8, darkness slider. Client-side only, no fog changes. | Rust-стиль ночи: плавные сумерки с 20:00, полная тьма 22:00-04:00, рассвет 04:00-06:00. Меню NumPad6/F8, слайдер силы тьмы. Только клиент, туман не меняется." />
   <Author value="DifRUST" />
-  <Version value="1.1.0" />
+  <Version value="1.2.0" />
   <Website value="https://github.com/Lesnoy87/difrust-client" />
   <SkipWithAntiCheat value="true" />
 </xml>
