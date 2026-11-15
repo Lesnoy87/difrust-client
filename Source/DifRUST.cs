@@ -25,8 +25,37 @@ internal static class RustSettings
     public const float MinNightFactor = 0.02f;
     public const float MaxNightFactor = 0.60f;
 
+    // Насколько ярче делать освещение под крышей (0 — как снаружи, 1 — как днём).
+    public const float DefaultIndoorBoost = 0.75f;
+
+    // Холодный оттенок ночи: 0 — как в ваниле, 1 — максимум синевы.
+    public const float DefaultNightTint = 0.45f;
+
     public static bool Enabled = true;
     public static float NightFactorValue = DefaultNightFactor;
+    public static float IndoorBoost = DefaultIndoorBoost;
+    public static float NightTint = DefaultNightTint;
+
+    // CVar-имена: хост раздаёт настройки ванильным NetPackageModifyCVar.
+    public const string CvarEnabled = "dr_on";
+    public const string CvarNight = "dr_night";
+    public const string CvarIndoor = "dr_indoor";
+    public const string CvarTint = "dr_tint";
+
+    private static float nextRead;
+    private static float nextSend;
+    private static bool dirty;
+
+    public static bool Synced { get; private set; }
+
+    public static bool IsHost
+    {
+        get
+        {
+            var cm = SingletonMonoBehaviour<ConnectionManager>.Instance;
+            return cm == null || cm.IsServer;
+        }
+    }
 
     private static string SettingsPath
     {
@@ -54,6 +83,8 @@ internal static class RustSettings
 
                 if (key == "enabled") Enabled = num >= 0.5f;
                 else if (key == "night") NightFactorValue = Mathf.Clamp(num, MinNightFactor, MaxNightFactor);
+                else if (key == "indoor") IndoorBoost = Mathf.Clamp01(num);
+                else if (key == "tint") NightTint = Mathf.Clamp01(num);
             }
         }
         catch
@@ -67,8 +98,8 @@ internal static class RustSettings
         {
             string text = string.Format(
                 System.Globalization.CultureInfo.InvariantCulture,
-                "enabled={0}\nnight={1}\n",
-                Enabled ? "1" : "0", NightFactorValue);
+                "enabled={0}\nnight={1}\nindoor={2}\ntint={3}\n",
+                Enabled ? "1" : "0", NightFactorValue, IndoorBoost, NightTint);
             File.WriteAllText(SettingsPath, text);
         }
         catch
@@ -80,7 +111,77 @@ internal static class RustSettings
     {
         Enabled = true;
         NightFactorValue = DefaultNightFactor;
+        IndoorBoost = DefaultIndoorBoost;
+        NightTint = DefaultNightTint;
+        MarkDirty();
         Save();
+    }
+
+    public static void MarkDirty()
+    {
+        dirty = true;
+    }
+
+    // Клиент берёт то, что ему прислал хост. Если сервер без мода —
+    // остаются свои настройки, и мод работает сам по себе.
+    public static void ReadFromLocalPlayer(EntityPlayerLocal player)
+    {
+        if (player == null || player.Buffs == null) return;
+        if (IsHost) return;
+
+        float now = Time.time;
+        if (now < nextRead) return;
+        nextRead = now + 0.2f;
+
+        EntityBuffs buffs = player.Buffs;
+        if (!buffs.HasCustomVar(CvarEnabled))
+        {
+            Synced = false;
+            return;
+        }
+
+        Synced = true;
+        Enabled = buffs.GetCustomVar(CvarEnabled) >= 0.5f;
+        NightFactorValue = Mathf.Clamp(buffs.GetCustomVar(CvarNight), MinNightFactor, MaxNightFactor);
+        IndoorBoost = Mathf.Clamp01(buffs.GetCustomVar(CvarIndoor));
+        NightTint = Mathf.Clamp01(buffs.GetCustomVar(CvarTint));
+    }
+
+    // Хост раздаёт настройки всем игрокам (не чаще 4 раз в секунду).
+    public static void Tick()
+    {
+        if (!IsHost) return;
+
+        World world = GameManager.Instance != null ? GameManager.Instance.World : null;
+        if (world == null) return;
+
+        if (dirty && Time.time >= nextSend)
+        {
+            dirty = false;
+            nextSend = Time.time + 0.25f;
+            Broadcast(world);
+        }
+    }
+
+    private static void Broadcast(World world)
+    {
+        var players = world.Players.list;
+        for (int i = 0; i < players.Count; i++)
+        {
+            EntityPlayer p = players[i];
+            if (p == null || p.Buffs == null) continue;
+
+            Send(p, CvarEnabled, Enabled ? 1f : 0f);
+            Send(p, CvarNight, NightFactorValue);
+            Send(p, CvarIndoor, IndoorBoost);
+            Send(p, CvarTint, NightTint);
+        }
+    }
+
+    private static void Send(EntityPlayer player, string name, float value)
+    {
+        player.Buffs.SetCustomVar(name, value, false, CVarOperation.set, false);
+        player.Buffs.SetCustomVarNetwork(name, value, CVarOperation.set);
     }
 }
 
@@ -247,7 +348,44 @@ internal static class RustLighting
         return hours + minutes / 60f;
     }
 
+    // Глубина ночи 0..1 — для холодного оттенка.
+    public static float NightDepth()
+    {
+        // Демо-ночь днём: часы показывают день, но по свету это ночь.
+        if (DemoActive) return 1f;
+
+        float clock = GetClock();
+        if (clock < 0f) return 0f;
+
+        if (clock >= DuskStart && clock < NightStart)
+            return Mathf.InverseLerp(DuskStart, NightStart, clock);
+        if (clock >= NightStart || clock < DawnStart) return 1f;
+        if (clock >= DawnStart && clock < DayStart)
+            return 1f - Mathf.InverseLerp(DawnStart, DayStart, clock);
+        return 0f;
+    }
+
     public static float GetFactor()
+    {
+        float factor = GetBaseFactor();
+        if (factor >= 0.999f) return factor;
+
+        // Под крышей подмешиваем «домашнюю» яркость: ночью на улице темно,
+        // в доме — терпимо. Плавно, по доле укрытия.
+        float shelter = NightIndoor.Level;
+        if (shelter <= 0.01f) return factor;
+
+        float indoor = Mathf.Lerp(factor, 1f, RustSettings.IndoorBoost);
+
+        // Потолок: в доме ночью всё равно должно быть темнее, чем днём.
+        // Иначе при 5% тьмы помещение выглядит как день и ломает демо.
+        float cap = Mathf.Max(factor, 0.5f);
+        indoor = Mathf.Min(indoor, cap);
+
+        return Mathf.Lerp(factor, indoor, shelter);
+    }
+
+    public static float GetBaseFactor()
     {
         if (!RustSettings.Enabled) return 1f;
 
@@ -299,6 +437,84 @@ internal static class RustLighting
     }
 }
 
+// «Мы под крышей» — своя проверка, без зависимости от Silent Fog.
+// 5 точек: центр и четыре смещения по 0.35 м, блоки на 2..8 м над ногами.
+// Если над самим игроком открытое небо — считаем, что мы на улице.
+internal static class NightIndoor
+{
+    private static int sampleFrame = -1;
+    private static float raw;
+    private static float smooth = -1f;
+    private static int smoothFrame = -1;
+
+    public static float Level
+    {
+        get
+        {
+            if (Time.frameCount != sampleFrame)
+            {
+                sampleFrame = Time.frameCount;
+                raw = Sample();
+            }
+
+            if (Time.frameCount == smoothFrame) return smooth;
+            smoothFrame = Time.frameCount;
+
+            if (smooth < 0f) smooth = raw;
+            else smooth = Mathf.Lerp(smooth, raw, Mathf.Clamp01(Time.deltaTime * 3f));
+
+            return smooth;
+        }
+    }
+
+    private static float Sample()
+    {
+        World world = GameManager.Instance != null ? GameManager.Instance.World : null;
+        EntityPlayerLocal player = world != null ? world.GetPrimaryPlayer() : null;
+        if (player == null) return 0f;
+
+        // Сейф-зона торговца — тоже «внутри», даже если здание дырявое.
+        try
+        {
+            if (world.IsWithinTraderArea(World.worldToBlockPos(player.position))) return 1f;
+        }
+        catch
+        {
+        }
+
+        Vector3 pos = player.position;
+        bool[] covered = new bool[5];
+        int hits = 0;
+
+        for (int i = 0; i < 5; i++)
+        {
+            float ox = 0f;
+            float oz = 0f;
+            if (i == 1) ox = 0.35f;
+            else if (i == 2) ox = -0.35f;
+            else if (i == 3) oz = 0.35f;
+            else if (i == 4) oz = -0.35f;
+
+            Vector3i p = World.worldToBlockPos(
+                new Vector3(pos.x + ox, pos.y + 0.2f, pos.z + oz));
+
+            for (int dy = 2; dy <= 8; dy++)
+            {
+                BlockValue bv = world.GetBlock(p.x, p.y + dy, p.z);
+                if (bv.isair) continue;
+
+                covered[i] = true;
+                hits++;
+                break;
+            }
+        }
+
+        if (!covered[0]) return 0f;
+
+        return hits / 5f;
+    }
+}
+
 // Ночная яркость луны/ambient.
 [HarmonyPatch(typeof(SkyManager), "GetMoonAmbientScale")]
 internal static class MoonLightPatch
@@ -345,8 +561,19 @@ internal static class AmbientLightPatch
     private static AmbientMode originalMode;
     private static bool hasOriginalMode;
 
+    // Холодный оттенок ночи: меньше красного, больше синего.
+    private static readonly Color ColdTint = new Color(0.82f, 0.92f, 1.12f, 1f);
+
     private static void Postfix()
     {
+        GameManager gm = GameManager.Instance;
+        EntityPlayerLocal player = gm != null && gm.World != null
+            ? gm.World.GetPrimaryPlayer()
+            : null;
+
+        RustSettings.ReadFromLocalPlayer(player);
+        RustSettings.Tick();
+
         float factor = RustLighting.GetFactor();
 
         if (factor >= 0.999f)
@@ -372,6 +599,17 @@ internal static class AmbientLightPatch
         RenderSettings.ambientEquatorColor *= factor;
         RenderSettings.ambientGroundColor *= factor;
         RenderSettings.ambientLight *= factor;
+
+        // Ночной оттенок: чем глубже ночь, тем холоднее свет.
+        float tintAmount = Mathf.Clamp01(RustLighting.NightDepth() * RustSettings.NightTint);
+        if (tintAmount > 0.01f)
+        {
+            Color tint = Color.Lerp(Color.white, ColdTint, tintAmount);
+            RenderSettings.ambientSkyColor *= tint;
+            RenderSettings.ambientEquatorColor *= tint;
+            RenderSettings.ambientGroundColor *= tint;
+            RenderSettings.ambientLight *= tint;
+        }
     }
 }
 
@@ -422,7 +660,7 @@ public class DifMenuBehaviour : MonoBehaviour
     }
 
     private bool open;
-    private Rect windowRect = new Rect(70f, 70f, 460f, 340f);
+    private Rect windowRect = new Rect(70f, 70f, 460f, 500f);
 
     private Texture2D panelTex;
     private Texture2D accentTex;
@@ -537,7 +775,7 @@ public class DifMenuBehaviour : MonoBehaviour
                 RustText.T("  Darkening enabled", "  Затемнение включено"),
                 toggleStyle
             );
-            if (was != RustSettings.Enabled) RustSettings.Save();
+            if (was != RustSettings.Enabled) { RustSettings.MarkDirty(); RustSettings.Save(); }
         }
 
         y += 34f;
@@ -557,6 +795,7 @@ public class DifMenuBehaviour : MonoBehaviour
         if (Mathf.Abs(newValue - value) > 0.0005f)
         {
             RustSettings.NightFactorValue = newValue;
+            RustSettings.MarkDirty();
             RustSettings.Save();
         }
 
@@ -569,6 +808,51 @@ public class DifMenuBehaviour : MonoBehaviour
                 "Меньше — темнее. 6% — почти полная тьма, 30% — мягкая ночь."),
             hintStyle);
         y += 26f;
+
+        // Ярче в помещениях.
+        GUI.Label(new Rect(18f, y, w - 130f, 20f),
+            RustText.T("Brighter indoors", "Ярче в помещениях"), labelStyle);
+        GUI.Label(new Rect(w - 110f, y, 92f, 20f),
+            Mathf.RoundToInt(RustSettings.IndoorBoost * 100f) + "%", valueStyle);
+
+        float indoor = RustSettings.IndoorBoost;
+        float newIndoor = GUI.HorizontalSlider(
+            new Rect(18f, y + 22f, w - 36f, 18f), indoor, 0f, 1f);
+
+        if (Mathf.Abs(newIndoor - indoor) > 0.001f)
+        {
+            RustSettings.IndoorBoost = Mathf.Clamp01(newIndoor);
+            RustSettings.MarkDirty();
+            RustSettings.Save();
+        }
+
+        y += 46f;
+
+        // Холодный оттенок ночи.
+        GUI.Label(new Rect(18f, y, w - 130f, 20f),
+            RustText.T("Cold night tint", "Холодный оттенок"), labelStyle);
+        GUI.Label(new Rect(w - 110f, y, 92f, 20f),
+            Mathf.RoundToInt(RustSettings.NightTint * 100f) + "%", valueStyle);
+
+        float tint = RustSettings.NightTint;
+        float newTint = GUI.HorizontalSlider(
+            new Rect(18f, y + 22f, w - 36f, 18f), tint, 0f, 1f);
+
+        if (Mathf.Abs(newTint - tint) > 0.001f)
+        {
+            RustSettings.NightTint = Mathf.Clamp01(newTint);
+            RustSettings.MarkDirty();
+            RustSettings.Save();
+        }
+
+        y += 46f;
+
+        GUI.Label(new Rect(18f, y, w - 36f, 20f),
+            RustText.T(
+                "Indoors: 0% = same as outside, 100% = almost daylight.",
+                "Помещения: 0% — как снаружи, 100% — почти дневной свет."),
+            hintStyle);
+        y += 22f;
 
         if (GUI.Button(new Rect(18f, y, 180f, 30f),
             RustText.T("Night now (30 s)", "Ночь сейчас (30 с)"), buttonStyle))

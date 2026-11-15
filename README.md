@@ -1,104 +1,92 @@
-# DifRUST — Rust Nights (source)
+# DifRUST — Rust-ночь
 
-Client-side lighting mod for 7 Days to Die 3.4.x. Version **1.1.0**.
+Отдельный клиентский мод **только для освещения**. Никакого тумана, зомби, лута и геймплея.
 
-## What it does
+## График
 
-- gradual dusk from 20:00 to 22:00;
-- full darkness from 22:00 to 04:00;
-- gradual dawn from 04:00 to 06:00;
-- normal lighting for the rest of the day.
+- **20:00–22:00** — плавное затемнение;
+- **22:00–04:00** — полная тьма;
+- **04:00–06:00** — плавный рассвет;
+- **06:00–20:00** — обычное освещение.
 
-Only lighting is changed. Fog, weather, zombies, loot, progression, POIs and network
-logic are untouched. There is no server component: the mod works on any server,
-including vanilla ones.
+## Что умеет
 
-## In-game menu
+- **Сила тьмы** — ночной множитель освещения (2–60%).
+- **Ярче в помещениях** — под крышей свет подмешивается к ночному. Проверка своя:
+  пять точек вокруг игрока, блоки на 2–8 м над ногами; открытое небо над головой —
+  значит улица. Сейф-зона торговца считается помещением.
+- **Холодный оттенок** — ночь не серая, а синеватая; сила зависит от глубины ночи.
+- **Синхронизация** — хост раздаёт настройки всем игрокам ванильным
+  `NetPackageModifyCVar` (CVar-ы `dr_on`, `dr_night`, `dr_indoor`, `dr_tint`).
+  На сервере без мода каждый играет со своими настройками.
+- **Ночь сейчас (30 с)** — демо-ночь для проверки, не трогает время мира.
 
-Press **NumPad6** or **F8**:
+## Установка
 
-- enable / disable;
-- darkness strength slider, 2–60% (default 6%);
-- "Night now (30 s)" — preview without waiting for 22:00;
-- reset to defaults.
+Скопировать папку `DifRUST` в:
 
-The menu follows the game language: English by default, Russian when the game runs
-in Russian. The language is detected at runtime, so no restart or manual switch is
-needed.
-
-Settings are stored in `DifRUST.cfg` next to the game's save data
-(`Application.persistentDataPath`) and restored on launch:
-
+```text
+<7 Days To Die>\Mods\DifRUST
 ```
+
+или в:
+
+```text
+%APPDATA%\7DaysToDie\Mods\DifRUST
+```
+
+Внутри:
+
+```text
+Mods\DifRUST\ModInfo.xml
+Mods\DifRUST\DifRUST.dll
+```
+
+Запускать игру **без EAC** — это DLL/Harmony-мод. Файлы EasyAntiCheat не изменяются.
+
+## Независимость
+
+- работает на любом сервере, даже без модов;
+- не требует Silent Fog и не конфликтует с ним — у каждого мода своя DLL;
+- если Silent Fog установлен, ночной туман сам ослабляется (это его настройка).
+
+## Меню
+
+`NumPad6` или `F8`. Настройки хранятся в `DifRUST.cfg` рядом с сохранениями:
+
+```text
 enabled=1
 night=0.06
+indoor=0.75
+tint=0.45
 ```
 
-## Harmony patches
-
-- `SkyManager.GetMoonAmbientScale` — moon ambient light during the dark hours;
-- `WorldEnvironment.AmbientSpectrumFrameUpdate` — ambient colour blending for dusk
-  and dawn.
-
-Both are postfix patches with a time-based factor; no other game systems are touched.
-
-## Requirements
-
-- .NET SDK 8/10 (for building)
-- 7 Days to Die 3.4.x
-- `0_TFP_Harmony`
-
-## Build
-
-From this folder:
+## Сборка
 
 ```powershell
-cd Source
+cd DifRUST\Source
 .\build.ps1
 ```
 
-Or with an explicit game path:
+Если игра установлена в другое место:
 
 ```powershell
-dotnet build .\Source\DifRUST.csproj -c Release -p:GameDir="C:\Program Files (x86)\Steam\steamapps\common\7 Days To Die"
+.\build.ps1 -GameDir "D:\SteamLibrary\steamapps\common\7 Days To Die"
 ```
 
-Build output:
+## Как проверить
 
-```text
-Source\bin\Release\netstandard2.1\DifRUST.dll
-```
+1. Запустить игру без EAC.
+2. Поставить время около 21:00 — должно постепенно темнеть.
+3. 22:00–04:00 — очень темно, нужны фонарь/свет.
+4. Зайти в дом — должно стать ощутимо светлее, плавно.
+5. Около 05:00 — постепенно светлеет.
+6. В логе клиента должно быть `Loaded Mod: DifRUST`.
 
-## Install
+## Ограничения
 
-```
-%APPDATA%\7DaysToDie\Mods\DifRUST\ModInfo.xml
-%APPDATA%\7DaysToDie\Mods\DifRUST\DifRUST.dll
-```
-
-Launch the game without EAC (DLL/Harmony mod). No EasyAntiCheat files are modified.
-
-## Source map
-
-- `Source/DifRUST.cs` — Harmony patches, schedule logic, settings, in-game menu.
-- `Source/DifRUST.csproj` — build project.
-- `Source/build.ps1` — build helper.
-- `ModInfo.xml` — mod metadata.
-- `CHANGELOG.md` — version history.
-
-## Compatibility
-
-- No known conflicts with server mods.
-- If another client mod also darkens nights, effects stack. Use only one night
-  lighting mod at a time.
-- Pairs with Silent Fog: that mod softens night fog when DifRUST is installed.
-
-## AI disclosure
-
-Code and documentation were created with AI assistance. No AI-generated visual
-assets, models, voices or textures are included. Testing and publishing are done
-by hand.
-
-## Version
-
-`1.1.0` — see `CHANGELOG.md` for the full history.
+- Только клиент: сервер и другие игроки не затрагиваются (кроме раздачи настроек хостом).
+- Не изменяет туман — это делает Silent Fog.
+- Демо-ночь не двигает солнце и небо: меняются ambient и направленный свет,
+  поэтому днём демо выглядит как «тёмная земля под светлым небом».
+- Для DLL-мода EAC должен быть выключен.
