@@ -31,16 +31,22 @@ internal static class RustSettings
     // Холодный оттенок ночи: 0 — как в ваниле, 1 — максимум синевы.
     public const float DefaultNightTint = 0.45f;
 
+    // Фазы луны: 0 — все ночи одинаковые, 1 — сильный контраст
+    // (полнолуние светлее, новолуние почти чёрное).
+    public const float DefaultMoonPhases = 0.5f;
+
     public static bool Enabled = true;
     public static float NightFactorValue = DefaultNightFactor;
     public static float IndoorBoost = DefaultIndoorBoost;
     public static float NightTint = DefaultNightTint;
+    public static float MoonPhases = DefaultMoonPhases;
 
     // CVar-имена: хост раздаёт настройки ванильным NetPackageModifyCVar.
     public const string CvarEnabled = "dr_on";
     public const string CvarNight = "dr_night";
     public const string CvarIndoor = "dr_indoor";
     public const string CvarTint = "dr_tint";
+    public const string CvarMoon = "dr_moon";
 
     private static float nextRead;
     private static float nextSend;
@@ -85,6 +91,7 @@ internal static class RustSettings
                 else if (key == "night") NightFactorValue = Mathf.Clamp(num, MinNightFactor, MaxNightFactor);
                 else if (key == "indoor") IndoorBoost = Mathf.Clamp01(num);
                 else if (key == "tint") NightTint = Mathf.Clamp01(num);
+                else if (key == "moon") MoonPhases = Mathf.Clamp01(num);
             }
         }
         catch
@@ -98,8 +105,8 @@ internal static class RustSettings
         {
             string text = string.Format(
                 System.Globalization.CultureInfo.InvariantCulture,
-                "enabled={0}\nnight={1}\nindoor={2}\ntint={3}\n",
-                Enabled ? "1" : "0", NightFactorValue, IndoorBoost, NightTint);
+                "enabled={0}\nnight={1}\nindoor={2}\ntint={3}\nmoon={4}\n",
+                Enabled ? "1" : "0", NightFactorValue, IndoorBoost, NightTint, MoonPhases);
             File.WriteAllText(SettingsPath, text);
         }
         catch
@@ -113,6 +120,34 @@ internal static class RustSettings
         NightFactorValue = DefaultNightFactor;
         IndoorBoost = DefaultIndoorBoost;
         NightTint = DefaultNightTint;
+        MoonPhases = DefaultMoonPhases;
+        MarkDirty();
+        Save();
+    }
+
+    // Пресеты: сила тьмы, яркость в помещениях, холодный оттенок.
+    // 0 — мягкая ночь, 1 — стандарт, 2 — жёсткий Rust.
+    public static void ApplyPreset(int index)
+    {
+        if (index == 0)
+        {
+            NightFactorValue = 0.30f;
+            IndoorBoost = 0.80f;
+            NightTint = 0.35f;
+        }
+        else if (index == 1)
+        {
+            NightFactorValue = 0.06f;
+            IndoorBoost = 0.75f;
+            NightTint = 0.45f;
+        }
+        else
+        {
+            NightFactorValue = 0.02f;
+            IndoorBoost = 0.45f;
+            NightTint = 0.65f;
+        }
+
         MarkDirty();
         Save();
     }
@@ -145,6 +180,8 @@ internal static class RustSettings
         NightFactorValue = Mathf.Clamp(buffs.GetCustomVar(CvarNight), MinNightFactor, MaxNightFactor);
         IndoorBoost = Mathf.Clamp01(buffs.GetCustomVar(CvarIndoor));
         NightTint = Mathf.Clamp01(buffs.GetCustomVar(CvarTint));
+        if (buffs.HasCustomVar(CvarMoon))
+            MoonPhases = Mathf.Clamp01(buffs.GetCustomVar(CvarMoon));
     }
 
     // Хост раздаёт настройки всем игрокам (не чаще 4 раз в секунду).
@@ -175,6 +212,7 @@ internal static class RustSettings
             Send(p, CvarNight, NightFactorValue);
             Send(p, CvarIndoor, IndoorBoost);
             Send(p, CvarTint, NightTint);
+            Send(p, CvarMoon, MoonPhases);
         }
     }
 
@@ -392,7 +430,8 @@ internal static class RustLighting
         World world = GameManager.Instance != null ? GameManager.Instance.World : null;
         if (world == null) return 1f;
 
-        float night = RustSettings.NightFactorValue;
+        float night = RustSettings.NightFactorValue * MoonMul();
+        night = Mathf.Clamp(night, 0.01f, 1f);
 
         if (Time.time < demoUntil) return night;
 
@@ -419,6 +458,36 @@ internal static class RustLighting
         }
 
         return factor;
+    }
+
+    // Фаза луны по номеру игрового дня: 0 — полнолуние, 4 — новолуние.
+    // Считаем сами от дня мира и не спрашиваем SkyManager: у него фазы
+    // могут отличаться между версиями игры.
+    public static int MoonPhase()
+    {
+        World world = GameManager.Instance != null ? GameManager.Instance.World : null;
+        if (world == null) return 0;
+
+        int days = GameUtils.WorldTimeToDays(world.GetWorldTime());
+        return ((days % 8) + 8) % 8;
+    }
+
+    // Множитель ночной яркости: полнолуние светлее, новолуние темнее.
+    public static float MoonMul()
+    {
+        float strength = RustSettings.MoonPhases;
+        if (strength <= 0.01f) return 1f;
+
+        float c = Mathf.Cos(MoonPhase() / 8f * Mathf.PI * 2f);
+        return 1f + c * strength * 0.45f;
+    }
+
+    public static string MoonName()
+    {
+        int p = MoonPhase();
+        if (p == 0) return RustText.T("full", "полная");
+        if (p == 4) return RustText.T("new", "новая");
+        return p < 4 ? RustText.T("waning", "убывает") : RustText.T("waxing", "растёт");
     }
 
     // Название текущего режима для меню.
@@ -660,7 +729,7 @@ public class DifMenuBehaviour : MonoBehaviour
     }
 
     private bool open;
-    private Rect windowRect = new Rect(70f, 70f, 460f, 500f);
+    private Rect windowRect = new Rect(70f, 70f, 460f, 604f);
 
     private Texture2D panelTex;
     private Texture2D accentTex;
@@ -780,6 +849,22 @@ public class DifMenuBehaviour : MonoBehaviour
 
         y += 34f;
 
+        // Пресеты в один клик.
+        GUI.Label(new Rect(18f, y, w - 36f, 20f),
+            RustText.T("PRESETS", "ПРЕСЕТЫ"), labelStyle);
+        y += 22f;
+
+        {
+            float bw = (w - 36f - 8f) / 3f;
+            if (GUI.Button(new Rect(18f, y, bw, 26f), RustText.T("Soft", "Мягкая"), buttonStyle))
+                RustSettings.ApplyPreset(0);
+            if (GUI.Button(new Rect(18f + bw + 4f, y, bw, 26f), RustText.T("Standard", "Стандарт"), buttonStyle))
+                RustSettings.ApplyPreset(1);
+            if (GUI.Button(new Rect(18f + (bw + 4f) * 2f, y, bw, 26f), RustText.T("Rust", "Rust"), buttonStyle))
+                RustSettings.ApplyPreset(2);
+        }
+        y += 36f;
+
         GUI.enabled = RustSettings.Enabled;
         GUI.Label(new Rect(18f, y, w - 130f, 20f), RustText.T("Darkness", "Сила тьмы"), labelStyle);
         GUI.Label(new Rect(w - 110f, y, 92f, 20f),
@@ -847,6 +932,32 @@ public class DifMenuBehaviour : MonoBehaviour
 
         y += 46f;
 
+        // Фазы луны.
+        GUI.Label(new Rect(18f, y, w - 150f, 20f),
+            RustText.T("Moon phases", "Фазы луны"), labelStyle);
+        GUI.Label(new Rect(w - 110f, y, 92f, 20f),
+            Mathf.RoundToInt(RustSettings.MoonPhases * 100f) + "%", valueStyle);
+
+        float moon = RustSettings.MoonPhases;
+        float newMoon = GUI.HorizontalSlider(
+            new Rect(18f, y + 22f, w - 36f, 18f), moon, 0f, 1f);
+
+        if (Mathf.Abs(newMoon - moon) > 0.001f)
+        {
+            RustSettings.MoonPhases = Mathf.Clamp01(newMoon);
+            RustSettings.MarkDirty();
+            RustSettings.Save();
+        }
+
+        y += 46f;
+
+        GUI.Label(new Rect(18f, y, w - 36f, 20f),
+            RustText.T(
+                "Moon: 0% = every night alike, 100% = full moon bright, new moon black.",
+                "Луна: 0% — все ночи одинаковые, 100% — полная светлая, новая почти чёрная."),
+            hintStyle);
+        y += 22f;
+
         GUI.Label(new Rect(18f, y, w - 36f, 20f),
             RustText.T(
                 "Indoors: 0% = same as outside, 100% = almost daylight.",
@@ -887,11 +998,12 @@ public class DifMenuBehaviour : MonoBehaviour
         GUI.Label(
             new Rect(18f, y, w - 36f, 40f),
             string.Format(
-                RustText.T("Mode: {0}  ·  time {1}  ·  darkness {2}%{3}",
-                           "Режим: {0}  ·  время {1}  ·  тьма {2}%{3}"),
+                RustText.T("Mode: {0}  ·  time {1}  ·  darkness {2}%  ·  moon {3}{4}",
+                           "Режим: {0}  ·  время {1}  ·  тьма {2}%  ·  луна {3}{4}"),
                 RustLighting.ModeName(),
                 clockText,
                 Mathf.RoundToInt(RustLighting.GetFactor() * 100f),
+                RustLighting.MoonName(),
                 demo),
             hintStyle
         );
