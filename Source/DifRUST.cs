@@ -431,7 +431,7 @@ internal static class RustLighting
         if (world == null) return 1f;
 
         float night = RustSettings.NightFactorValue * MoonMul();
-        night = Mathf.Clamp(night, 0.01f, 1f);
+        night = Mathf.Clamp(night, 0.01f, 0.85f);
 
         if (Time.time < demoUntil) return night;
 
@@ -472,14 +472,23 @@ internal static class RustLighting
         return ((days % 8) + 8) % 8;
     }
 
-    // Множитель ночной яркости: полнолуние светлее, новолуние темнее.
+    // Множитель ночной яркости: полнолуние заметно светлее, новолуние темнее.
+    // Раньше это был процент от тьмы, и при 6% разница была невидимой,
+    // поэтому размах большой: до ×2.5 на полной и ×0.25 на новой луне.
     public static float MoonMul()
     {
         float strength = RustSettings.MoonPhases;
         if (strength <= 0.01f) return 1f;
 
         float c = Mathf.Cos(MoonPhase() / 8f * Mathf.PI * 2f);
-        return 1f + c * strength * 0.45f;
+        return Mathf.Max(0.25f, 1f + c * strength * 1.5f);
+    }
+
+    // Во сколько раз сейчас ярче/темнее от луны — для строки состояния.
+    public static string MoonMulText()
+    {
+        return "×" + MoonMul().ToString("0.00",
+            System.Globalization.CultureInfo.InvariantCulture);
     }
 
     public static string MoonName()
@@ -619,6 +628,16 @@ internal static class MoonIntensityPatch
         if (SkyManager.moonLight != null)
         {
             SkyManager.moonLight.intensity *= factor;
+
+            // Холодный оттенок виден именно на лунном свете: ambient при 6%
+            // тьмы уже почти нулевой, и умножение на синеву там не читается.
+            float tint = Mathf.Clamp01(RustLighting.NightDepth() * RustSettings.NightTint);
+            if (tint > 0.01f)
+            {
+                Color cold = new Color(0.60f, 0.76f, 1.00f, 1f);
+                SkyManager.moonLight.color =
+                    Color.Lerp(SkyManager.moonLight.color, cold, tint * 0.85f);
+            }
         }
     }
 }
@@ -629,9 +648,6 @@ internal static class AmbientLightPatch
 {
     private static AmbientMode originalMode;
     private static bool hasOriginalMode;
-
-    // Холодный оттенок ночи: меньше красного, больше синего.
-    private static readonly Color ColdTint = new Color(0.82f, 0.92f, 1.12f, 1f);
 
     private static void Postfix()
     {
@@ -673,11 +689,12 @@ internal static class AmbientLightPatch
         float tintAmount = Mathf.Clamp01(RustLighting.NightDepth() * RustSettings.NightTint);
         if (tintAmount > 0.01f)
         {
-            Color tint = Color.Lerp(Color.white, ColdTint, tintAmount);
-            RenderSettings.ambientSkyColor *= tint;
-            RenderSettings.ambientEquatorColor *= tint;
-            RenderSettings.ambientGroundColor *= tint;
-            RenderSettings.ambientLight *= tint;
+            // При сильной тьме цвета уже почти нулевые — умножение на синеву
+            // не видно. Поэтому добавляем холодную подсветку абсолютной величиной.
+            Color floor = new Color(0.010f, 0.016f, 0.030f, 0f) * tintAmount;
+            RenderSettings.ambientLight += floor;
+            RenderSettings.ambientSkyColor += floor * 1.4f;
+            RenderSettings.ambientEquatorColor += floor;
         }
     }
 }
@@ -998,12 +1015,13 @@ public class DifMenuBehaviour : MonoBehaviour
         GUI.Label(
             new Rect(18f, y, w - 36f, 40f),
             string.Format(
-                RustText.T("Mode: {0}  ·  time {1}  ·  darkness {2}%  ·  moon {3}{4}",
-                           "Режим: {0}  ·  время {1}  ·  тьма {2}%  ·  луна {3}{4}"),
+                RustText.T("Mode: {0}  ·  time {1}  ·  darkness {2}%  ·  moon {3} {4}{5}",
+                           "Режим: {0}  ·  время {1}  ·  тьма {2}%  ·  луна {3} {4}{5}"),
                 RustLighting.ModeName(),
                 clockText,
                 Mathf.RoundToInt(RustLighting.GetFactor() * 100f),
                 RustLighting.MoonName(),
+                RustLighting.MoonMulText(),
                 demo),
             hintStyle
         );
