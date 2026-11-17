@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.4.1
+
+- Cold night tint fixed: it now applies to the moonlight itself instead of
+  multiplying ambient colours that are already almost zero at 6% darkness.
+- Moon phases are clearly visible: brightness range x0.25..x2.5; the status
+  line shows the current multiplier (e.g. "moon waxing x1.75").
+- Night brightness capped at 0.85 so a full moon does not turn into day.
+
+## 1.4.0
+
+- Moon phases: full moon is brighter, new moon is nearly black. The
+  "Moon phases" slider controls contrast (0-100%) and syncs as `dr_moon`;
+  saved as `moon` in `DifRUST.cfg`.
+- Three one-click presets: Soft (30% darkness), Standard (6%), Rust (2%).
+- The status line shows the current phase: full / new / waning / waxing.
+
 ## 1.3.0
 
 - Brighter indoors: under a roof the night light is mixed back up, so a house is
