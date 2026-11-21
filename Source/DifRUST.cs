@@ -14,9 +14,34 @@ public class DifRUSTMod : IModApi
 {
     public void InitMod(Mod _modInstance)
     {
-        new Harmony("difrust.client").PatchAll(Assembly.GetExecutingAssembly());
+        // Сначала настройки и меню: даже если один патч не найдёт метод,
+        // мод останется управляемым и запишет ошибку в лог.
         RustSettings.Load();
         DifMenu.Create();
+
+        try
+        {
+            Harmony harmony = new Harmony("difrust.client");
+            Type[] types = Assembly.GetExecutingAssembly().GetTypes();
+            for (int i = 0; i < types.Length; i++)
+            {
+                Type type = types[i];
+                if (type.GetCustomAttributes(typeof(HarmonyPatch), true).Length == 0) continue;
+
+                try
+                {
+                    harmony.CreateClassProcessor(type).Patch();
+                }
+                catch (Exception e)
+                {
+                    Debug.LogError("[DifRUST] patch " + type.Name + " failed: " + e);
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            Debug.LogError("[DifRUST] patch init failed: " + e);
+        }
     }
 }
 
@@ -68,12 +93,39 @@ internal static class RustSettings
     public const string CvarBiomeOn = "dr_biome";
     public const string CvarBiomeAmount = "dr_biome_amt";
     public const string CvarLunar = "dr_lunar";
+    public const string CvarNvg = "dr_nvg";
+    public const string CvarSeq = "dr_seq";
 
     private static float nextRead;
     private static float nextSend;
     private static float nextHeartbeat;
     private static float nextForce;
     private static bool dirty;
+
+    // Отложенная запись cfg: не дёргаем диск на каждое движение ползунка.
+    private static bool pendingSave;
+    private static float nextSave;
+
+    // Хост-замок: dr_seq обновляется пульсом. Если он замер — замок снимается.
+    private static float hostSeq;
+    private static float lockSeq;
+    private static float lockSeqTime;
+    private static bool lockSeqSeen;
+
+    // Локальные настройки клиента на время замка.
+    private static bool hasSnapshot;
+    private static bool snapEnabled;
+    private static float snapNight;
+    private static float snapIndoor;
+    private static float snapTint;
+    private static float snapMoon;
+    private static float snapBiomeAmount;
+    private static bool snapWeather;
+    private static bool snapEyes;
+    private static bool snapLight;
+    private static bool snapNvg;
+    private static bool snapBiomeOn;
+    private static bool snapLunar;
 
     public static bool Synced { get; private set; }
 
@@ -134,6 +186,33 @@ internal static class RustSettings
     }
 
     public static void Save()
+    {
+        if (Forced && !IsHost) return;
+        pendingSave = true;
+    }
+
+    // Запись на диск не чаще раза в секунду; финальный сброс — при закрытии меню.
+    private static void TickSave()
+    {
+        if (!pendingSave) return;
+        if (Forced && !IsHost) return;
+        if (Time.time < nextSave) return;
+
+        pendingSave = false;
+        nextSave = Time.time + 1f;
+        WriteFile();
+    }
+
+    public static void FlushSave()
+    {
+        if (!pendingSave) return;
+        if (Forced && !IsHost) return;
+
+        pendingSave = false;
+        WriteFile();
+    }
+
+    private static void WriteFile()
     {
         try
         {
@@ -204,14 +283,55 @@ internal static class RustSettings
         dirty = true;
     }
 
+    private static void CaptureLocal()
+    {
+        if (hasSnapshot) return;
+
+        hasSnapshot = true;
+        snapEnabled = Enabled;
+        snapNight = NightFactorValue;
+        snapIndoor = IndoorBoost;
+        snapTint = NightTint;
+        snapMoon = MoonPhases;
+        snapBiomeAmount = BiomeTintValue;
+        snapWeather = WeatherOn;
+        snapEyes = EyeAdapt;
+        snapLight = LightRelief;
+        snapNvg = NvgRelief;
+        snapBiomeOn = BiomeTintOn;
+        snapLunar = LunarLink;
+    }
+
+    private static void RestoreLocal()
+    {
+        if (!hasSnapshot) return;
+
+        hasSnapshot = false;
+        Enabled = snapEnabled;
+        NightFactorValue = snapNight;
+        IndoorBoost = snapIndoor;
+        NightTint = snapTint;
+        MoonPhases = snapMoon;
+        BiomeTintValue = snapBiomeAmount;
+        WeatherOn = snapWeather;
+        EyeAdapt = snapEyes;
+        LightRelief = snapLight;
+        NvgRelief = snapNvg;
+        BiomeTintOn = snapBiomeOn;
+        LunarLink = snapLunar;
+        MarkDirty();
+    }
+
     // Клиент берёт то, что ему прислал хост, но только под серверным замком.
     // Без замка каждый крутит под свой монитор.
     public static void ReadFromLocalPlayer(EntityPlayerLocal player)
     {
         if (player == null || player.Buffs == null) return;
+
         if (IsHost)
         {
-            // В своей игре замка нет: не тащим состояние с чужого сервера.
+            // В своей игре замка нет: возвращаем локальные настройки.
+            if (hasSnapshot) RestoreLocal();
             Synced = false;
             Forced = false;
             return;
@@ -224,6 +344,7 @@ internal static class RustSettings
         EntityBuffs buffs = player.Buffs;
         if (!buffs.HasCustomVar(CvarEnabled))
         {
+            if (hasSnapshot) RestoreLocal();
             Synced = false;
             Forced = false;
             return;
@@ -232,8 +353,39 @@ internal static class RustSettings
         Synced = true;
         bool force = buffs.HasCustomVar(CvarForce)
             && buffs.GetCustomVar(CvarForce) >= 0.5f;
-        Forced = force;
-        if (!force) return;
+
+        if (force)
+        {
+            // Замок должен подтверждаться пульсом (dr_seq). Если хост
+            // перестал слать настройки, через 6 секунд замок снимается.
+            if (!buffs.HasCustomVar(CvarSeq))
+            {
+                // Старый хост без dr_seq: не держим клиента вечно.
+                force = false;
+            }
+            else
+            {
+                float seq = buffs.GetCustomVar(CvarSeq);
+                if (!lockSeqSeen || Mathf.Abs(seq - lockSeq) > 0.001f)
+                {
+                    lockSeq = seq;
+                    lockSeqTime = now;
+                    lockSeqSeen = true;
+                }
+                if (now - lockSeqTime > 6f) force = false;
+            }
+        }
+
+        if (!force)
+        {
+            if (hasSnapshot) RestoreLocal();
+            Forced = false;
+            lockSeqSeen = false;
+            return;
+        }
+
+        if (!hasSnapshot) CaptureLocal();
+        Forced = true;
 
         Enabled = buffs.GetCustomVar(CvarEnabled) >= 0.5f;
         NightFactorValue = Mathf.Clamp(buffs.GetCustomVar(CvarNight), MinNightFactor, MaxNightFactor);
@@ -247,6 +399,8 @@ internal static class RustSettings
             EyeAdapt = buffs.GetCustomVar(CvarEyes) >= 0.5f;
         if (buffs.HasCustomVar(CvarLight))
             LightRelief = buffs.GetCustomVar(CvarLight) >= 0.5f;
+        if (buffs.HasCustomVar(CvarNvg))
+            NvgRelief = buffs.GetCustomVar(CvarNvg) >= 0.5f;
         if (buffs.HasCustomVar(CvarBiomeOn))
             BiomeTintOn = buffs.GetCustomVar(CvarBiomeOn) >= 0.5f;
         if (buffs.HasCustomVar(CvarBiomeAmount))
@@ -258,6 +412,7 @@ internal static class RustSettings
     // Хост раздаёт настройки всем игрокам.
     public static void Tick()
     {
+        TickSave();
         if (!IsHost) return;
 
         World world = GameManager.Instance != null ? GameManager.Instance.World : null;
@@ -289,29 +444,42 @@ internal static class RustSettings
 
     private static void BroadcastForce(World world)
     {
+        hostSeq += 1f;
+
         var players = world.Players.list;
         for (int i = 0; i < players.Count; i++)
         {
             EntityPlayer p = players[i];
             if (p == null || p.Buffs == null) continue;
 
+            Send(p, CvarSeq, hostSeq);
             Send(p, CvarForce, 1f);
             Send(p, CvarEnabled, 1f);
             Send(p, CvarNight, NightFactorValue);
             Send(p, CvarIndoor, IndoorBoost);
             Send(p, CvarTint, NightTint);
             Send(p, CvarMoon, MoonPhases);
+            Send(p, CvarWeather, WeatherOn ? 1f : 0f);
+            Send(p, CvarEyes, EyeAdapt ? 1f : 0f);
+            Send(p, CvarLight, LightRelief ? 1f : 0f);
+            Send(p, CvarNvg, NvgRelief ? 1f : 0f);
+            Send(p, CvarBiomeOn, BiomeTintOn ? 1f : 0f);
+            Send(p, CvarBiomeAmount, BiomeTintValue);
+            Send(p, CvarLunar, LunarLink ? 1f : 0f);
         }
     }
 
     private static void Broadcast(World world)
     {
+        hostSeq += 1f;
+
         var players = world.Players.list;
         for (int i = 0; i < players.Count; i++)
         {
             EntityPlayer p = players[i];
             if (p == null || p.Buffs == null) continue;
 
+            Send(p, CvarSeq, hostSeq);
             Send(p, CvarForce, (ForceForClients && Enabled) ? 1f : 0f);
             Send(p, CvarEnabled, Enabled ? 1f : 0f);
             Send(p, CvarNight, NightFactorValue);
@@ -321,6 +489,7 @@ internal static class RustSettings
             Send(p, CvarWeather, WeatherOn ? 1f : 0f);
             Send(p, CvarEyes, EyeAdapt ? 1f : 0f);
             Send(p, CvarLight, LightRelief ? 1f : 0f);
+            Send(p, CvarNvg, NvgRelief ? 1f : 0f);
             Send(p, CvarBiomeOn, BiomeTintOn ? 1f : 0f);
             Send(p, CvarBiomeAmount, BiomeTintValue);
             Send(p, CvarLunar, LunarLink ? 1f : 0f);
@@ -475,6 +644,7 @@ internal static class RustLighting
     private static float smoothIndoor = -1f;
     private static float smoothTint = -1f;
     private static float smoothMoon = -1f;
+    private static float smoothMoonMul = -1f;
     private static float smoothBiome = -1f;
     private static float smoothWeather = -1f;
 
@@ -566,6 +736,12 @@ internal static class RustLighting
         smoothBiome = Mathf.Lerp(smoothBiome,
             RustSettings.BiomeTintOn ? RustSettings.BiomeTintValue : 0f, k);
 
+        // Фаза LunarEvents приходит с ночным баффом и может смениться
+        // одним шагом. Сглаживаем сам множитель, а не только ползунок.
+        float moonTarget = MoonMul(smoothMoon);
+        smoothMoonMul = first ? moonTarget
+            : Mathf.Lerp(smoothMoonMul, moonTarget, Mathf.Clamp01(Time.deltaTime * 1.2f));
+
         LightRelief.Tick(LocalPlayer);
 
         float weather = WeatherMul();
@@ -625,7 +801,7 @@ internal static class RustLighting
         World world = GameManager.Instance != null ? GameManager.Instance.World : null;
         if (world == null) return 1f;
 
-        float night = smoothNight * MoonMul(smoothMoon) * smoothWeather;
+        float night = smoothNight * smoothMoonMul * smoothWeather;
         night = Mathf.Clamp(night, 0.02f, 0.85f);
 
         if (Time.time < demoUntil) return night;
@@ -794,7 +970,9 @@ internal static class RustLighting
     {
         float clock = GetClock();
         if (clock < 0f) return null;
-        if (clock >= DayStart && clock < DuskStart) return null;
+
+        // Только ночь и рассвет: 22:00–06:00. Днём и на закате не показываем.
+        if (!(clock >= NightStart || clock < DayStart)) return null;
 
         float remain = clock >= NightStart ? 24f - clock + DayStart : DayStart - clock;
         if (remain < 0f) remain = 0f;
@@ -908,6 +1086,8 @@ internal static class NightIndoor
     private static float raw;
     private static float smooth = -1f;
     private static int smoothFrame = -1;
+    private static float nextSample;
+    private static readonly bool[] covered = new bool[5];
 
     public static float Level
     {
@@ -916,7 +1096,11 @@ internal static class NightIndoor
             if (Time.frameCount != sampleFrame)
             {
                 sampleFrame = Time.frameCount;
-                raw = Sample();
+                if (Time.time >= nextSample)
+                {
+                    nextSample = Time.time + 0.2f;
+                    raw = Sample();
+                }
             }
 
             if (Time.frameCount == smoothFrame) return smooth;
@@ -945,7 +1129,7 @@ internal static class NightIndoor
         }
 
         Vector3 pos = player.position;
-        bool[] covered = new bool[5];
+        for (int i = 0; i < covered.Length; i++) covered[i] = false;
         int hits = 0;
 
         for (int i = 0; i < 5; i++)
@@ -1136,11 +1320,12 @@ internal static class LightRelief
                     if (string.IsNullOrEmpty(name)) continue;
                     name = name.ToLowerInvariant();
                     if (name.Contains("lightoak")) continue; // «светлый дуб», не свет
+                    if (name.Contains("nolight")) continue;  // выключенная вывеска
                     if (name.Contains("campfire") || name.Contains("forge")
+                        || name.Contains("fireplace")
                         || name.Contains("torch") || name.Contains("lantern")
                         || name.Contains("candle") || name.Contains("lamp")
-                        || name.Contains("light") || name.Contains("fire")
-                        || name.Contains("ember"))
+                        || name.Contains("light") || name.Contains("ember"))
                         return true;
                 }
             }
@@ -1177,33 +1362,48 @@ internal static class SunIntensityPatch
 [HarmonyPatch(typeof(SkyManager), "UpdateSunMoonAngles")]
 internal static class MoonIntensityPatch
 {
+    private static float lastIntensity;
+    private static bool hasLast;
+
     private static void Postfix()
     {
+        if (SkyManager.moonLight == null) return;
+
+        // Ваниль каждый вызов переписывает intensity и color. Если значение
+        // не изменилось с прошлого нашего применения, значит метод вышел
+        // раньше — повторно умножать нельзя, иначе свет накопится.
+        float incoming = SkyManager.moonLight.intensity;
+        if (hasLast && Mathf.Approximately(incoming, lastIntensity)) return;
+
         float factor = RustLighting.GetFactor();
-        if (factor >= 0.999f) return;
-
-        if (SkyManager.moonLight != null)
+        if (factor >= 0.999f)
         {
-            SkyManager.moonLight.intensity *= factor;
-
-            float tint = RustLighting.TintAmount();
-            if (tint > 0.01f)
-            {
-                SkyManager.moonLight.color = Color.Lerp(
-                    SkyManager.moonLight.color, RustLighting.ColdTint(), tint * 0.85f);
-            }
-
-            // Биомный оттенок: та же палитра, что у Silent Fog.
-            Color palette;
-            float biome = RustLighting.BiomeAmount();
-            if (biome > 0.01f && RustLighting.BiomePalette(out palette))
-            {
-                Color nightPalette = RustLighting.KeepLuma(
-                    palette, SkyManager.moonLight.color);
-                SkyManager.moonLight.color = Color.Lerp(
-                    SkyManager.moonLight.color, nightPalette, biome * 0.85f);
-            }
+            hasLast = false;
+            return;
         }
+
+        SkyManager.moonLight.intensity *= factor;
+
+        float tint = RustLighting.TintAmount();
+        if (tint > 0.01f)
+        {
+            SkyManager.moonLight.color = Color.Lerp(
+                SkyManager.moonLight.color, RustLighting.ColdTint(), tint * 0.85f);
+        }
+
+        // Биомный оттенок: та же палитра, что у Silent Fog.
+        Color palette;
+        float biome = RustLighting.BiomeAmount();
+        if (biome > 0.01f && RustLighting.BiomePalette(out palette))
+        {
+            Color nightPalette = RustLighting.KeepLuma(
+                palette, SkyManager.moonLight.color);
+            SkyManager.moonLight.color = Color.Lerp(
+                SkyManager.moonLight.color, nightPalette, biome * 0.85f);
+        }
+
+        lastIntensity = SkyManager.moonLight.intensity;
+        hasLast = true;
     }
 }
 
@@ -1252,26 +1452,29 @@ internal static class AmbientLightPatch
 
         // Ночной оттенок: чем глубже ночь, тем холоднее свет.
         float tintAmount = RustLighting.TintAmount();
-        if (tintAmount > 0.01f)
+        float biome = RustLighting.BiomeAmount();
+
+        if (tintAmount > 0.01f || biome > 0.01f)
         {
-            // При сильной тьме цвета уже почти нулевые — умножение на синеву
-            // не видно. Поэтому добавляем холодную подсветку абсолютной величиной.
-            Color hue = new Color(0.010f, 0.016f, 0.030f, 0f);
+            // При сильной тьме цвета уже почти нулевые — добавляем подсветку
+            // абсолютной величиной. Холод и биом считаем раздельно, чтобы
+            // биомный оттенок работал и при выключенном холодном.
+            Color floor = new Color(0.010f, 0.016f, 0.030f, 0f) * tintAmount;
 
             Color palette;
-            float biome = RustLighting.BiomeAmount();
             if (biome > 0.01f && RustLighting.BiomePalette(out palette))
             {
                 // Та же яркость, но оттенок биома — как у тумана Silent Fog.
                 float l = RustLighting.Luma(palette);
                 if (l > 0.001f)
                 {
-                    Color biomeHue = palette * (0.020f / l);
-                    hue = Color.Lerp(hue, biomeHue, biome);
+                    Color biomeHue = palette * (0.020f / l) * biome;
+                    // Биом главнее холодного оттенка, но не выключает его совсем.
+                    floor = Color.Lerp(floor, biomeHue, 0.75f);
                 }
             }
 
-            Color floor = hue * tintAmount;
+            floor.a = 0f;
             RenderSettings.ambientLight += floor;
             RenderSettings.ambientSkyColor += floor * 1.4f;
             RenderSettings.ambientEquatorColor += floor;
@@ -1439,11 +1642,18 @@ public class DifMenuBehaviour : MonoBehaviour
         open = false;
         IsOpen = false;
 
+        RustSettings.FlushSave();
+
         GameManager gm = GameManager.Instance;
         if (gm != null)
         {
             gm.SetCursorEnabledOverride(false, false);
         }
+    }
+
+    private void OnApplicationQuit()
+    {
+        RustSettings.FlushSave();
     }
 
     private void OnGUI()
@@ -1459,6 +1669,12 @@ public class DifMenuBehaviour : MonoBehaviour
         );
 
         windowRect = GUI.Window(0x6D52, windowRect, DrawWindow, GUIContent.none, GUIStyle.none);
+
+        // Не даём утащить окно за край экрана.
+        windowRect.x = Mathf.Clamp(windowRect.x, 0f,
+            Mathf.Max(0f, Screen.width - windowRect.width));
+        windowRect.y = Mathf.Clamp(windowRect.y, 0f,
+            Mathf.Max(0f, Screen.height - windowRect.height));
     }
 
     private void DrawWindow(int id)
@@ -1540,6 +1756,8 @@ public class DifMenuBehaviour : MonoBehaviour
         y += 24f;
         ToggleAt(18f, y, colW, ref RustSettings.LunarLink,
             RustText.T("  LunarEvents", "  LunarEvents"));
+        ToggleAt(18f + colW + 8f, y, colW, ref RustSettings.NvgRelief,
+            RustText.T("  NVG", "  ПНВ"));
         GUI.enabled = true;
 
         y += 26f;

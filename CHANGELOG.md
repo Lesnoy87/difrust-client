@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.5.1
+
+- Host lock now requires a live heartbeat (`dr_seq`); if the host stops sending
+  settings or runs without the mod, clients unlock after 6 seconds.
+- Client settings are snapshotted under lock and restored afterwards; host
+  values are never saved into the client's `DifRUST.cfg`.
+- Harmony patches are applied per class with error logging, so one failed patch
+  does not block settings or the menu.
+- Dawn timer no longer shows 00:00 during dusk (20:00-22:00).
+- Biome ambient tint works independently of the cold tint slider.
+- Moon multiplier is smoothed when the LunarEvents phase changes.
+- `Save()` is debounced (once per second, flushed on menu close).
+- NVG relief is host-synced as `dr_nvg` and has its own menu toggle.
+- Roof detection is cached (5 Hz); the menu window is clamped to the screen.
+- Network send remains `SetCustomVar(..., false, ...)` + `SetCustomVarNetwork`
+  by design: local update plus explicit network broadcast.
+
 ## 1.5.0
 
 - Weather and clouds now affect night lighting: clear nights are brighter,

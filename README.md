@@ -1,4 +1,4 @@
-# DifRUST — Rust Nights 1.5.0
+# DifRUST — Rust Nights 1.5.1
 
 Client-side lighting mod for 7 Days to Die 3.4.x. Only lighting is changed: fog,
 weather, zombies, loot, progression and network logic are untouched.
@@ -11,6 +11,24 @@ weather, zombies, loot, progression and network logic are untouched.
 | 22:00–04:00 | full darkness |
 | 04:00–06:00 | gradual dawn |
 | 06:00–20:00 | normal lighting |
+
+## What's new in 1.5.1
+
+- Host lock now needs a fresh heartbeat (`dr_seq`). If the host stops sending
+  settings or plays without the mod, clients unlock after 6 seconds instead of
+  staying locked forever.
+- Client settings are snapshotted while locked and restored afterwards, so the
+  host's values are no longer written into the client's `DifRUST.cfg`.
+- Harmony patches are applied per class with error logging; one failed patch no
+  longer prevents the menu and settings from loading.
+- Dawn timer is hidden during dusk instead of showing 00:00.
+- Biome ambient tint works even with the cold tint slider at 0.
+- Moon multiplier is smoothed when the LunarEvents phase changes.
+- `Save()` is debounced (once per second, flushed on menu close), no disk writes
+  on every slider frame.
+- NVG relief is now host-synced (`dr_nvg`) and has its own menu toggle.
+- Roof detection is cached (5 times per second) and window position is clamped
+  to the screen.
 
 ## What's new in 1.5.0
 
@@ -44,7 +62,7 @@ Press **NumPad6** or **F8** in game:
 - enable / disable the mod;
 - presets: **Soft**, **Standard**, **Rust**;
 - effect toggles: weather, eye adaptation, flashlight/fire, biome tint,
-  LunarEvents;
+  LunarEvents, NVG;
 - **Host lock** (host only): same night for all players;
 - darkness strength slider, 2–60% (default 6%);
 - brighter indoors, cold night tint, moon phases;
@@ -105,7 +123,7 @@ assets, models, voices or textures are included.
 
 ---
 
-# DifRUST — Rust Nights 1.5.0 (RU)
+# DifRUST — Rust Nights 1.5.1 (RU)
 
 Клиентский мод освещения для 7 Days to Die 3.4.x. Меняется только свет: туман,
 погода, зомби, лут, прокачка и сеть не затронуты.
@@ -118,6 +136,21 @@ assets, models, voices or textures are included.
 | 22:00–04:00 | полная тьма |
 | 04:00–06:00 | плавный рассвет |
 | 06:00–20:00 | обычный свет |
+
+## Что нового в 1.5.1
+
+- Замок хоста теперь требует свежий пульс (`dr_seq`). Если хост перестал
+  слать настройки или играет без мода, через 6 секунд замок снимается.
+- Настройки клиента запоминаются на время замка и возвращаются после него,
+  значения хоста больше не попадают в `DifRUST.cfg`.
+- Патчи Harmony применяются по классам с логом ошибок; один сломанный патч
+  больше не мешает меню и настройкам.
+- Таймер рассвета скрыт на закате вместо «00:00».
+- Биомный ambient работает даже при «Холодный оттенок = 0».
+- Множитель луны сглаживается при смене фазы LunarEvents.
+- `Save()` пишет cfg не чаще раза в секунду и сбрасывается при закрытии меню.
+- ПНВ синхронизируется (`dr_nvg`) и имеет свой тумблер.
+- Проверка крыши кэшируется (5 раз в секунду), окно не уезжает за край.
 
 ## Что нового в 1.5.0
 
@@ -151,7 +184,8 @@ assets, models, voices or textures are included.
 
 - включить / выключить мод;
 - пресеты: **Мягкая**, **Стандарт**, **Rust**;
-- тумблеры эффектов: погода, адаптация глаз, фонарь/огонь, биомы, LunarEvents;
+- тумблеры эффектов: погода, адаптация глаз, фонарь/огонь, биомы, LunarEvents,
+  ПНВ;
 - **Замок хоста** (только у хоста): одна ночь для всех игроков;
 - слайдер «Сила тьмы», 2–60% (по умолчанию 6%);
 - ярче в помещениях, холодный оттенок, фазы луны;
