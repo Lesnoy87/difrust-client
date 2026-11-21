@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
 using HarmonyLib;
@@ -35,11 +36,24 @@ internal static class RustSettings
     // (полнолуние светлее, новолуние почти чёрное).
     public const float DefaultMoonPhases = 0.5f;
 
+    // Биомный оттенок ночи. Палитра — как в Silent Fog.
+    public const float DefaultBiomeTint = 0.55f;
+
     public static bool Enabled = true;
     public static float NightFactorValue = DefaultNightFactor;
     public static float IndoorBoost = DefaultIndoorBoost;
     public static float NightTint = DefaultNightTint;
     public static float MoonPhases = DefaultMoonPhases;
+
+    // Эффекты 1.5.0.
+    public static bool WeatherOn = true;
+    public static bool EyeAdapt = true;
+    public static bool LightRelief = true;
+    public static bool NvgRelief = true;
+    public static bool BiomeTintOn = true;
+    public static bool LunarLink = true;
+    public static bool ForceForClients = true;
+    public static float BiomeTintValue = DefaultBiomeTint;
 
     // CVar-имена: хост раздаёт настройки ванильным NetPackageModifyCVar.
     public const string CvarEnabled = "dr_on";
@@ -47,12 +61,24 @@ internal static class RustSettings
     public const string CvarIndoor = "dr_indoor";
     public const string CvarTint = "dr_tint";
     public const string CvarMoon = "dr_moon";
+    public const string CvarForce = "dr_force";
+    public const string CvarWeather = "dr_weather";
+    public const string CvarEyes = "dr_eyes";
+    public const string CvarLight = "dr_light";
+    public const string CvarBiomeOn = "dr_biome";
+    public const string CvarBiomeAmount = "dr_biome_amt";
+    public const string CvarLunar = "dr_lunar";
 
     private static float nextRead;
     private static float nextSend;
+    private static float nextHeartbeat;
+    private static float nextForce;
     private static bool dirty;
 
     public static bool Synced { get; private set; }
+
+    // Клиент под серверным замком: меню блокируется, настройки от хоста.
+    public static bool Forced { get; private set; }
 
     public static bool IsHost
     {
@@ -92,6 +118,14 @@ internal static class RustSettings
                 else if (key == "indoor") IndoorBoost = Mathf.Clamp01(num);
                 else if (key == "tint") NightTint = Mathf.Clamp01(num);
                 else if (key == "moon") MoonPhases = Mathf.Clamp01(num);
+                else if (key == "weather") WeatherOn = num >= 0.5f;
+                else if (key == "eyes") EyeAdapt = num >= 0.5f;
+                else if (key == "light") LightRelief = num >= 0.5f;
+                else if (key == "nvg") NvgRelief = num >= 0.5f;
+                else if (key == "biome") BiomeTintOn = num >= 0.5f;
+                else if (key == "biome_amount") BiomeTintValue = Mathf.Clamp01(num);
+                else if (key == "lunar") LunarLink = num >= 0.5f;
+                else if (key == "force") ForceForClients = num >= 0.5f;
             }
         }
         catch
@@ -105,8 +139,13 @@ internal static class RustSettings
         {
             string text = string.Format(
                 System.Globalization.CultureInfo.InvariantCulture,
-                "enabled={0}\nnight={1}\nindoor={2}\ntint={3}\nmoon={4}\n",
-                Enabled ? "1" : "0", NightFactorValue, IndoorBoost, NightTint, MoonPhases);
+                "enabled={0}\nnight={1}\nindoor={2}\ntint={3}\nmoon={4}\n" +
+                "weather={5}\neyes={6}\nlight={7}\nnvg={8}\nbiome={9}\n" +
+                "biome_amount={10}\nlunar={11}\nforce={12}\n",
+                Enabled ? "1" : "0", NightFactorValue, IndoorBoost, NightTint, MoonPhases,
+                WeatherOn ? "1" : "0", EyeAdapt ? "1" : "0", LightRelief ? "1" : "0",
+                NvgRelief ? "1" : "0", BiomeTintOn ? "1" : "0", BiomeTintValue,
+                LunarLink ? "1" : "0", ForceForClients ? "1" : "0");
             File.WriteAllText(SettingsPath, text);
         }
         catch
@@ -121,6 +160,14 @@ internal static class RustSettings
         IndoorBoost = DefaultIndoorBoost;
         NightTint = DefaultNightTint;
         MoonPhases = DefaultMoonPhases;
+        WeatherOn = true;
+        EyeAdapt = true;
+        LightRelief = true;
+        NvgRelief = true;
+        BiomeTintOn = true;
+        BiomeTintValue = DefaultBiomeTint;
+        LunarLink = true;
+        ForceForClients = true;
         MarkDirty();
         Save();
     }
@@ -157,12 +204,18 @@ internal static class RustSettings
         dirty = true;
     }
 
-    // Клиент берёт то, что ему прислал хост. Если сервер без мода —
-    // остаются свои настройки, и мод работает сам по себе.
+    // Клиент берёт то, что ему прислал хост, но только под серверным замком.
+    // Без замка каждый крутит под свой монитор.
     public static void ReadFromLocalPlayer(EntityPlayerLocal player)
     {
         if (player == null || player.Buffs == null) return;
-        if (IsHost) return;
+        if (IsHost)
+        {
+            // В своей игре замка нет: не тащим состояние с чужого сервера.
+            Synced = false;
+            Forced = false;
+            return;
+        }
 
         float now = Time.time;
         if (now < nextRead) return;
@@ -172,19 +225,37 @@ internal static class RustSettings
         if (!buffs.HasCustomVar(CvarEnabled))
         {
             Synced = false;
+            Forced = false;
             return;
         }
 
         Synced = true;
+        bool force = buffs.HasCustomVar(CvarForce)
+            && buffs.GetCustomVar(CvarForce) >= 0.5f;
+        Forced = force;
+        if (!force) return;
+
         Enabled = buffs.GetCustomVar(CvarEnabled) >= 0.5f;
         NightFactorValue = Mathf.Clamp(buffs.GetCustomVar(CvarNight), MinNightFactor, MaxNightFactor);
         IndoorBoost = Mathf.Clamp01(buffs.GetCustomVar(CvarIndoor));
         NightTint = Mathf.Clamp01(buffs.GetCustomVar(CvarTint));
         if (buffs.HasCustomVar(CvarMoon))
             MoonPhases = Mathf.Clamp01(buffs.GetCustomVar(CvarMoon));
+        if (buffs.HasCustomVar(CvarWeather))
+            WeatherOn = buffs.GetCustomVar(CvarWeather) >= 0.5f;
+        if (buffs.HasCustomVar(CvarEyes))
+            EyeAdapt = buffs.GetCustomVar(CvarEyes) >= 0.5f;
+        if (buffs.HasCustomVar(CvarLight))
+            LightRelief = buffs.GetCustomVar(CvarLight) >= 0.5f;
+        if (buffs.HasCustomVar(CvarBiomeOn))
+            BiomeTintOn = buffs.GetCustomVar(CvarBiomeOn) >= 0.5f;
+        if (buffs.HasCustomVar(CvarBiomeAmount))
+            BiomeTintValue = Mathf.Clamp01(buffs.GetCustomVar(CvarBiomeAmount));
+        if (buffs.HasCustomVar(CvarLunar))
+            LunarLink = buffs.GetCustomVar(CvarLunar) >= 0.5f;
     }
 
-    // Хост раздаёт настройки всем игрокам (не чаще 4 раз в секунду).
+    // Хост раздаёт настройки всем игрокам.
     public static void Tick()
     {
         if (!IsHost) return;
@@ -197,6 +268,39 @@ internal static class RustSettings
             dirty = false;
             nextSend = Time.time + 0.25f;
             Broadcast(world);
+            return;
+        }
+
+        // Новые игроки получают настройки и без правок в меню.
+        if (Time.time >= nextHeartbeat)
+        {
+            nextHeartbeat = Time.time + 5f;
+            Broadcast(world);
+        }
+
+        // Серверный замок: короткий heartbeat, чтобы клиент не мог
+        // выключить затемнение дольше ~1.5 с.
+        if (ForceForClients && Enabled && Time.time >= nextForce)
+        {
+            nextForce = Time.time + 1.5f;
+            BroadcastForce(world);
+        }
+    }
+
+    private static void BroadcastForce(World world)
+    {
+        var players = world.Players.list;
+        for (int i = 0; i < players.Count; i++)
+        {
+            EntityPlayer p = players[i];
+            if (p == null || p.Buffs == null) continue;
+
+            Send(p, CvarForce, 1f);
+            Send(p, CvarEnabled, 1f);
+            Send(p, CvarNight, NightFactorValue);
+            Send(p, CvarIndoor, IndoorBoost);
+            Send(p, CvarTint, NightTint);
+            Send(p, CvarMoon, MoonPhases);
         }
     }
 
@@ -208,11 +312,18 @@ internal static class RustSettings
             EntityPlayer p = players[i];
             if (p == null || p.Buffs == null) continue;
 
+            Send(p, CvarForce, (ForceForClients && Enabled) ? 1f : 0f);
             Send(p, CvarEnabled, Enabled ? 1f : 0f);
             Send(p, CvarNight, NightFactorValue);
             Send(p, CvarIndoor, IndoorBoost);
             Send(p, CvarTint, NightTint);
             Send(p, CvarMoon, MoonPhases);
+            Send(p, CvarWeather, WeatherOn ? 1f : 0f);
+            Send(p, CvarEyes, EyeAdapt ? 1f : 0f);
+            Send(p, CvarLight, LightRelief ? 1f : 0f);
+            Send(p, CvarBiomeOn, BiomeTintOn ? 1f : 0f);
+            Send(p, CvarBiomeAmount, BiomeTintValue);
+            Send(p, CvarLunar, LunarLink ? 1f : 0f);
         }
     }
 
@@ -359,6 +470,24 @@ internal static class RustLighting
 
     private static float demoUntil;
 
+    // Сглаженные настройки: пресет меняется не щелчком, а за ~1 секунду.
+    private static float smoothNight = -1f;
+    private static float smoothIndoor = -1f;
+    private static float smoothTint = -1f;
+    private static float smoothMoon = -1f;
+    private static float smoothBiome = -1f;
+    private static float smoothWeather = -1f;
+
+    private static int updateFrame = -1;
+    private static float factorTarget = 1f;
+    private static float factorCurrent = 1f;
+    private static bool initialized;
+    private static World lastWorld;
+
+    // Кэш фазы LunarEvents, чтобы не дёргать баффы каждый кадр.
+    private static int lunarPhase = -1;
+    private static float nextLunarCheck;
+
     public static void ForceNight(float seconds)
     {
         demoUntil = Time.time + seconds;
@@ -403,68 +532,190 @@ internal static class RustLighting
         return 0f;
     }
 
-    public static float GetFactor()
+    private static EntityPlayerLocal LocalPlayer
     {
-        float factor = GetBaseFactor();
-        if (factor >= 0.999f) return factor;
-
-        // Под крышей подмешиваем «домашнюю» яркость: ночью на улице темно,
-        // в доме — терпимо. Плавно, по доле укрытия.
-        float shelter = NightIndoor.Level;
-        if (shelter <= 0.01f) return factor;
-
-        float indoor = Mathf.Lerp(factor, 1f, RustSettings.IndoorBoost);
-
-        // Потолок: в доме ночью всё равно должно быть темнее, чем днём.
-        // Иначе при 5% тьмы помещение выглядит как день и ломает демо.
-        float cap = Mathf.Max(factor, 0.5f);
-        indoor = Mathf.Min(indoor, cap);
-
-        return Mathf.Lerp(factor, indoor, shelter);
+        get
+        {
+            World world = GameManager.Instance != null ? GameManager.Instance.World : null;
+            return world != null ? world.GetPrimaryPlayer() : null;
+        }
     }
 
-    public static float GetBaseFactor()
+    // Один расчёт на кадр: сглаживаем настройки, считаем цель,
+    // затем адаптируем «глаза» (медленнее в темноту, быстрее в свет).
+    private static void UpdateSmooth()
+    {
+        if (initialized && Time.frameCount == updateFrame) return;
+
+        World world = GameManager.Instance != null ? GameManager.Instance.World : null;
+        if (!ReferenceEquals(world, lastWorld))
+        {
+            lastWorld = world;
+            initialized = false;
+            lunarPhase = -1;
+        }
+
+        updateFrame = Time.frameCount;
+        bool first = !initialized;
+
+        float k = first ? 1f : Mathf.Clamp01(Time.deltaTime * 1.2f);
+        smoothNight = Mathf.Lerp(smoothNight, RustSettings.NightFactorValue, k);
+        smoothIndoor = Mathf.Lerp(smoothIndoor, RustSettings.IndoorBoost, k);
+        smoothTint = Mathf.Lerp(smoothTint, RustSettings.NightTint, k);
+        smoothMoon = Mathf.Lerp(smoothMoon, RustSettings.MoonPhases, k);
+        smoothBiome = Mathf.Lerp(smoothBiome,
+            RustSettings.BiomeTintOn ? RustSettings.BiomeTintValue : 0f, k);
+
+        LightRelief.Tick(LocalPlayer);
+
+        float weather = WeatherMul();
+        smoothWeather = first ? weather
+            : Mathf.Lerp(smoothWeather, weather, Mathf.Clamp01(Time.deltaTime / 3f));
+
+        factorTarget = ComputeTarget();
+
+        if (first || !RustSettings.EyeAdapt)
+        {
+            factorCurrent = factorTarget;
+        }
+        else
+        {
+            // В темноту глаза привыкают 2.4 с, к свету — 1.1 с.
+            float seconds = factorTarget < factorCurrent ? 2.4f : 1.1f;
+            factorCurrent = Mathf.MoveTowards(
+                factorCurrent, factorTarget, Time.deltaTime / seconds);
+        }
+
+        initialized = true;
+    }
+
+    public static float GetFactor()
+    {
+        UpdateSmooth();
+        return factorCurrent;
+    }
+
+    // Целевая яркость: расписание + погода + луна + помещение + ПНВ/свет.
+    private static float ComputeTarget()
+    {
+        float factor = ComputeScheduleFactor();
+        if (factor >= 0.999f) return factor;
+
+        // Под крышей подмешиваем «домашнюю» яркость.
+        float shelter = NightIndoor.Level;
+        if (shelter > 0.01f)
+        {
+            float indoor = Mathf.Lerp(factor, 1f, smoothIndoor);
+            float cap = Mathf.Max(factor, 0.5f);
+            indoor = Mathf.Min(indoor, cap);
+            factor = Mathf.Lerp(factor, indoor, shelter);
+        }
+
+        // ПНВ и локальный свет: не даём тьме съесть спасательный свет.
+        float relief = LightRelief.Floor;
+        if (relief > factor) factor = relief;
+
+        return Mathf.Clamp(factor, 0.02f, 1f);
+    }
+
+    private static float ComputeScheduleFactor()
     {
         if (!RustSettings.Enabled) return 1f;
 
         World world = GameManager.Instance != null ? GameManager.Instance.World : null;
         if (world == null) return 1f;
 
-        float night = RustSettings.NightFactorValue * MoonMul();
-        night = Mathf.Clamp(night, 0.01f, 0.85f);
+        float night = smoothNight * MoonMul(smoothMoon) * smoothWeather;
+        night = Mathf.Clamp(night, 0.02f, 0.85f);
 
         if (Time.time < demoUntil) return night;
 
         float clock = GetClock();
-        float factor;
 
         if (clock >= DuskStart && clock < NightStart)
         {
             float t = Mathf.InverseLerp(DuskStart, NightStart, clock);
-            factor = Mathf.Lerp(1f, night, t);
+            return Mathf.Lerp(1f, night, t);
         }
-        else if (clock >= NightStart || clock < DawnStart)
-        {
-            factor = night;
-        }
-        else if (clock >= DawnStart && clock < DayStart)
+        if (clock >= NightStart || clock < DawnStart) return night;
+        if (clock >= DawnStart && clock < DayStart)
         {
             float t = Mathf.InverseLerp(DawnStart, DayStart, clock);
-            factor = Mathf.Lerp(night, 1f, t);
+            return Mathf.Lerp(night, 1f, t);
         }
-        else
-        {
-            factor = 1f;
-        }
-
-        return factor;
+        return 1f;
     }
 
-    // Фаза луны по номеру игрового дня: 0 — полнолуние, 4 — новолуние.
-    // Считаем сами от дня мира и не спрашиваем SkyManager: у него фазы
-    // могут отличаться между версиями игры.
+    // Для меню/диагностики: расписание без помещения и адаптации.
+    public static float GetBaseFactor()
+    {
+        UpdateSmooth();
+        return factorTarget;
+    }
+
+    // Погода: облака и осадки только ослабляют луну, саму погоду не меняем.
+    private static float WeatherMul()
+    {
+        if (!RustSettings.WeatherOn) return 1f;
+
+        try
+        {
+            WeatherManager wm = WeatherManager.Instance;
+            if (wm == null) return 1f;
+
+            float cloud = Mathf.Clamp01(wm.GetCurrentCloudThicknessPercent());
+            float rain = Mathf.Clamp01(wm.GetCurrentRainfallPercent());
+            float snow = Mathf.Clamp01(wm.GetCurrentSnowfallPercent());
+            float precip = Mathf.Max(rain, snow);
+
+            // Ясно — 1.0, плотная облачность — ~0.73, ливень/гроза — 0.55.
+            float dark = Mathf.Clamp01(cloud * 0.60f + precip * 0.50f);
+            return Mathf.Lerp(1f, 0.55f, dark);
+        }
+        catch
+        {
+            return 1f;
+        }
+    }
+
+    public static string WeatherName()
+    {
+        if (!RustSettings.WeatherOn) return RustText.T("off", "выкл");
+
+        try
+        {
+            WeatherManager wm = WeatherManager.Instance;
+            if (wm == null) return "—";
+
+            float cloud = Mathf.Clamp01(wm.GetCurrentCloudThicknessPercent());
+            float rain = Mathf.Clamp01(wm.GetCurrentRainfallPercent());
+            float snow = Mathf.Clamp01(wm.GetCurrentSnowfallPercent());
+
+            if (rain > 0.35f) return RustText.T("rain", "дождь");
+            if (snow > 0.35f) return RustText.T("snow", "снег");
+            if (cloud > 0.75f) return RustText.T("overcast", "пасмурно");
+            if (cloud > 0.45f) return RustText.T("cloudy", "облачно");
+            return RustText.T("clear", "ясно");
+        }
+        catch
+        {
+            return "—";
+        }
+    }
+
+    // Фаза луны: сначала LunarEvents, если он есть, потом day % 8.
     public static int MoonPhase()
     {
+        if (RustSettings.LunarLink)
+        {
+            if (Time.time >= nextLunarCheck)
+            {
+                nextLunarCheck = Time.time + 0.3f;
+                lunarPhase = LunarEventsPhase(LocalPlayer);
+            }
+            if (lunarPhase >= 0) return lunarPhase;
+        }
+
         World world = GameManager.Instance != null ? GameManager.Instance.World : null;
         if (world == null) return 0;
 
@@ -472,19 +723,43 @@ internal static class RustLighting
         return ((days % 8) + 8) % 8;
     }
 
+    // Ночные базовые баффы LunarEvents = индекс фазы 0..7.
+    private static readonly string[] LunarPhaseBuffs =
+    {
+        "lunar_xp_up",
+        "lunar_speed_up",
+        "lunar_damage_up",
+        "lunar_crit_up",
+        "lunar_xp_down",
+        "lunar_speed_down",
+        "lunar_damage_down",
+        "lunar_crit_down",
+    };
+
+    private static int LunarEventsPhase(EntityPlayerLocal player)
+    {
+        if (player == null || player.Buffs == null) return -1;
+        for (int i = 0; i < LunarPhaseBuffs.Length; i++)
+        {
+            if (player.Buffs.HasBuff(LunarPhaseBuffs[i])) return i;
+        }
+        return -1;
+    }
+
     // Множитель ночной яркости: полнолуние заметно светлее, новолуние темнее.
-    // Раньше это был процент от тьмы, и при 6% разница была невидимой,
-    // поэтому размах большой: до ×2.5 на полной и ×0.25 на новой луне.
     public static float MoonMul()
     {
-        float strength = RustSettings.MoonPhases;
+        return MoonMul(RustSettings.MoonPhases);
+    }
+
+    private static float MoonMul(float strength)
+    {
         if (strength <= 0.01f) return 1f;
 
         float c = Mathf.Cos(MoonPhase() / 8f * Mathf.PI * 2f);
         return Mathf.Max(0.25f, 1f + c * strength * 1.5f);
     }
 
-    // Во сколько раз сейчас ярче/темнее от луны — для строки состояния.
     public static string MoonMulText()
     {
         return "×" + MoonMul().ToString("0.00",
@@ -512,6 +787,115 @@ internal static class RustLighting
         if (clock >= NightStart || clock < DawnStart) return RustText.T("night", "ночь");
         if (clock >= DawnStart && clock < DayStart) return RustText.T("dawn", "рассвет");
         return RustText.T("day", "день");
+    }
+
+    // Сколько игрового времени осталось до 06:00 (только ночью/на рассвете).
+    public static string DawnText()
+    {
+        float clock = GetClock();
+        if (clock < 0f) return null;
+        if (clock >= DayStart && clock < DuskStart) return null;
+
+        float remain = clock >= NightStart ? 24f - clock + DayStart : DayStart - clock;
+        if (remain < 0f) remain = 0f;
+
+        int h = Mathf.FloorToInt(remain);
+        int m = Mathf.FloorToInt((remain - h) * 60f);
+        return string.Format("{0:00}:{1:00}", h, m);
+    }
+
+    // ===== Биомный цветокор: палитра один в один как в Silent Fog =====
+
+    public static bool BiomePalette(out Color color)
+    {
+        color = Color.white;
+
+        EntityPlayerLocal player = LocalPlayer;
+        if (player == null || player.biomeStandingOn == null) return false;
+
+        string name = player.biomeStandingOn.m_sBiomeName;
+        if (string.IsNullOrEmpty(name)) return false;
+
+        switch (name.ToLowerInvariant())
+        {
+            case "snow":
+                color = new Color(0.62f, 0.78f, 1.00f, 1f);
+                return true;
+            case "desert":
+                color = new Color(1.00f, 0.62f, 0.34f, 1f);
+                return true;
+            case "radiated":
+                color = new Color(0.62f, 0.90f, 0.26f, 1f);
+                return true;
+            case "wasteland":
+            case "wasteland_hub":
+            case "city_wasteland":
+                color = new Color(0.86f, 0.58f, 0.28f, 1f);
+                return true;
+            case "burnt_forest":
+                color = new Color(0.52f, 0.46f, 0.38f, 1f);
+                return true;
+            default:
+                return false; // лес, равнины, город — не трогаем
+        }
+    }
+
+    public static string BiomeName()
+    {
+        EntityPlayerLocal player = LocalPlayer;
+        if (player == null || player.biomeStandingOn == null) return "—";
+
+        string name = player.biomeStandingOn.m_sBiomeName;
+        if (string.IsNullOrEmpty(name)) return "—";
+
+        switch (name.ToLowerInvariant())
+        {
+            case "snow": return RustText.T("snow", "снег");
+            case "desert": return RustText.T("desert", "пустыня");
+            case "radiated": return RustText.T("radiated", "радиация");
+            case "wasteland":
+            case "wasteland_hub":
+            case "city_wasteland": return RustText.T("wasteland", "пустошь");
+            case "burnt_forest": return RustText.T("burnt", "горелый лес");
+            case "pine_forest": return RustText.T("pine forest", "сосновый лес");
+            case "forest": return RustText.T("forest", "лес");
+            case "plains": return RustText.T("plains", "равнины");
+            case "city": return RustText.T("city", "город");
+            default: return name;
+        }
+    }
+
+    // Подгоняем палитру под яркость текущего света: меняется оттенок,
+    // а не яркость. Так туман и свет в биоме совпадают по цвету.
+    public static Color KeepLuma(Color palette, Color source)
+    {
+        float src = Luma(source);
+        float dst = Luma(palette);
+        if (dst < 0.001f) return palette;
+
+        Color scaled = palette * (src / dst);
+        scaled.a = 1f;
+        return scaled;
+    }
+
+    public static float Luma(Color c)
+    {
+        return 0.299f * c.r + 0.587f * c.g + 0.114f * c.b;
+    }
+
+    public static Color ColdTint()
+    {
+        return new Color(0.60f, 0.76f, 1.00f, 1f);
+    }
+
+    public static float TintAmount()
+    {
+        return Mathf.Clamp01(NightDepth() * smoothTint);
+    }
+
+    public static float BiomeAmount()
+    {
+        return Mathf.Clamp01(NightDepth() * smoothBiome);
     }
 }
 
@@ -593,6 +977,179 @@ internal static class NightIndoor
     }
 }
 
+// ПНВ, фонарь, костёр/факел рядом. Без жёстких ссылок на другие моды.
+internal static class LightRelief
+{
+    private static int frame = -1;
+    private static float nextScan;
+    private static bool nvg;
+    private static bool held;
+    private static bool nearby;
+
+    // Насколько поднять пол тьмы. ПНВ — сильнее, локальный свет — мягче.
+    public static float Floor
+    {
+        get
+        {
+            if (nvg) return 0.35f;
+            if (held || nearby) return 0.14f;
+            return 0f;
+        }
+    }
+
+    public static bool NvgActive { get { return nvg; } }
+    public static bool HeldLight { get { return held; } }
+
+    public static void Tick(EntityPlayerLocal player)
+    {
+        if (Time.frameCount == frame) return;
+        frame = Time.frameCount;
+
+        if (Time.time < nextScan) return;
+        nextScan = Time.time + 0.35f;
+
+        nvg = false;
+        held = false;
+        nearby = false;
+
+        if (player == null) return;
+
+        try
+        {
+            nvg = HasNvg(player);
+            held = HasHeldLight(player);
+            nearby = HasNearbyLight(player);
+        }
+        catch
+        {
+        }
+    }
+
+    private static bool HasNvg(EntityPlayerLocal player)
+    {
+        if (!RustSettings.NvgRelief) return false;
+
+        if (player.Buffs != null)
+        {
+            List<BuffValue> buffs = player.Buffs.ActiveBuffs;
+            if (buffs != null)
+            {
+                for (int i = 0; i < buffs.Count; i++)
+                {
+                    BuffValue bv = buffs[i];
+                    if (bv == null) continue;
+                    if (NameLooksLikeNvg(bv.BuffName)) return true;
+                }
+            }
+        }
+
+        // Некоторые моды делают ПНВ предметом в руке или в экипировке.
+        ItemClass held = HeldItem(player);
+        if (held != null && NameLooksLikeNvg(held.Name)) return true;
+
+        try
+        {
+            if (player.equipment != null)
+            {
+                int count = player.equipment.GetSlotCount();
+                for (int i = 0; i < count; i++)
+                {
+                    ItemValue iv = player.equipment.GetSlotItem(i);
+                    if (iv == null || iv.ItemClass == null) continue;
+                    if (NameLooksLikeNvg(iv.ItemClass.Name)) return true;
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        return false;
+    }
+
+    private static bool NameLooksLikeNvg(string name)
+    {
+        if (string.IsNullOrEmpty(name)) return false;
+        name = name.ToLowerInvariant();
+        return name.Contains("nightvision") || name.Contains("night_vision")
+            || name.Contains("nvg") || name.Contains("goggles");
+    }
+
+    private static ItemClass HeldItem(EntityPlayerLocal player)
+    {
+        if (player.inventory == null) return null;
+        return player.inventory.holdingItem;
+    }
+
+    private static bool HasHeldLight(EntityPlayerLocal player)
+    {
+        if (!RustSettings.LightRelief) return false;
+        if (player.inventory == null) return false;
+
+        ItemClass item = player.inventory.holdingItem;
+        if (item == null) return false;
+
+        try
+        {
+            if (item.IsLightSource()) return true;
+        }
+        catch
+        {
+        }
+
+        string name = item.Name;
+        if (string.IsNullOrEmpty(name)) return false;
+        name = name.ToLowerInvariant();
+        return name.Contains("flashlight") || name.Contains("torch")
+            || name.Contains("lantern");
+    }
+
+    private static bool HasNearbyLight(EntityPlayerLocal player)
+    {
+        if (!RustSettings.LightRelief) return false;
+
+        World world = GameManager.Instance != null ? GameManager.Instance.World : null;
+        if (world == null) return false;
+
+        Vector3i c = World.worldToBlockPos(player.position);
+
+        // Грубая сетка 5x4x5 вокруг игрока: костёр, факел, фонарь, лампа.
+        for (int dx = -4; dx <= 4; dx += 2)
+        {
+            for (int dz = -4; dz <= 4; dz += 2)
+            {
+                for (int dy = -1; dy <= 2; dy++)
+                {
+                    Vector3i p = new Vector3i(c.x + dx, c.y + dy, c.z + dz);
+                    BlockValue bv = world.GetBlock(p.x, p.y, p.z);
+                    if (bv.isair || bv.Block == null) continue;
+
+                    try
+                    {
+                        if (bv.Block.GetLightValue(bv) > 0) return true;
+                    }
+                    catch
+                    {
+                    }
+
+                    string name = bv.Block.GetBlockName();
+                    if (string.IsNullOrEmpty(name)) continue;
+                    name = name.ToLowerInvariant();
+                    if (name.Contains("lightoak")) continue; // «светлый дуб», не свет
+                    if (name.Contains("campfire") || name.Contains("forge")
+                        || name.Contains("torch") || name.Contains("lantern")
+                        || name.Contains("candle") || name.Contains("lamp")
+                        || name.Contains("light") || name.Contains("fire")
+                        || name.Contains("ember"))
+                        return true;
+                }
+            }
+        }
+
+        return false;
+    }
+}
+
 // Ночная яркость луны/ambient.
 [HarmonyPatch(typeof(SkyManager), "GetMoonAmbientScale")]
 internal static class MoonLightPatch
@@ -629,14 +1186,22 @@ internal static class MoonIntensityPatch
         {
             SkyManager.moonLight.intensity *= factor;
 
-            // Холодный оттенок виден именно на лунном свете: ambient при 6%
-            // тьмы уже почти нулевой, и умножение на синеву там не читается.
-            float tint = Mathf.Clamp01(RustLighting.NightDepth() * RustSettings.NightTint);
+            float tint = RustLighting.TintAmount();
             if (tint > 0.01f)
             {
-                Color cold = new Color(0.60f, 0.76f, 1.00f, 1f);
-                SkyManager.moonLight.color =
-                    Color.Lerp(SkyManager.moonLight.color, cold, tint * 0.85f);
+                SkyManager.moonLight.color = Color.Lerp(
+                    SkyManager.moonLight.color, RustLighting.ColdTint(), tint * 0.85f);
+            }
+
+            // Биомный оттенок: та же палитра, что у Silent Fog.
+            Color palette;
+            float biome = RustLighting.BiomeAmount();
+            if (biome > 0.01f && RustLighting.BiomePalette(out palette))
+            {
+                Color nightPalette = RustLighting.KeepLuma(
+                    palette, SkyManager.moonLight.color);
+                SkyManager.moonLight.color = Color.Lerp(
+                    SkyManager.moonLight.color, nightPalette, biome * 0.85f);
             }
         }
     }
@@ -686,12 +1251,27 @@ internal static class AmbientLightPatch
         RenderSettings.ambientLight *= factor;
 
         // Ночной оттенок: чем глубже ночь, тем холоднее свет.
-        float tintAmount = Mathf.Clamp01(RustLighting.NightDepth() * RustSettings.NightTint);
+        float tintAmount = RustLighting.TintAmount();
         if (tintAmount > 0.01f)
         {
             // При сильной тьме цвета уже почти нулевые — умножение на синеву
             // не видно. Поэтому добавляем холодную подсветку абсолютной величиной.
-            Color floor = new Color(0.010f, 0.016f, 0.030f, 0f) * tintAmount;
+            Color hue = new Color(0.010f, 0.016f, 0.030f, 0f);
+
+            Color palette;
+            float biome = RustLighting.BiomeAmount();
+            if (biome > 0.01f && RustLighting.BiomePalette(out palette))
+            {
+                // Та же яркость, но оттенок биома — как у тумана Silent Fog.
+                float l = RustLighting.Luma(palette);
+                if (l > 0.001f)
+                {
+                    Color biomeHue = palette * (0.020f / l);
+                    hue = Color.Lerp(hue, biomeHue, biome);
+                }
+            }
+
+            Color floor = hue * tintAmount;
             RenderSettings.ambientLight += floor;
             RenderSettings.ambientSkyColor += floor * 1.4f;
             RenderSettings.ambientEquatorColor += floor;
@@ -718,9 +1298,58 @@ internal static class DifInputBlockPatch
     }
 }
 
-internal static class DifMenu
+// Другой мод, который тоже затемняет ночь: предупреждаем в меню.
+internal static class RustConflicts
 {
-    public static void Create()
+    private static string name;
+    private static float nextCheck;
+
+    public static string Name
+    {
+        get
+        {
+            if (Time.time >= nextCheck)
+            {
+                nextCheck = Time.time + 5f;
+                name = Detect();
+            }
+            return name;
+        }
+    }
+
+    private static string Detect()
+    {
+        try
+        {
+            string root = ModManager.ModsBasePath;
+            if (string.IsNullOrEmpty(root) || !Directory.Exists(root)) return null;
+
+            string[] dirs = Directory.GetDirectories(root);
+            for (int i = 0; i < dirs.Length; i++)
+            {
+                string folder = Path.GetFileName(dirs[i]);
+                if (string.IsNullOrEmpty(folder)) continue;
+
+                string n = folder.ToLowerInvariant();
+                if (n.Contains("difrust") || n.StartsWith("0_tfp")) continue;
+
+                if (n.Contains("rustnight") || n.Contains("darknight")
+                    || n.Contains("nightmod") || n.Contains("nightclient")
+                    || n.Contains("nightterror") || n.Contains("darker")
+                    || n.Contains("darkness"))
+                    return folder;
+            }
+        }
+        catch
+        {
+        }
+
+        return null;
+    }
+}
+
+internal static class DifMenu
+{    public static void Create()
     {
         try
         {
@@ -746,7 +1375,7 @@ public class DifMenuBehaviour : MonoBehaviour
     }
 
     private bool open;
-    private Rect windowRect = new Rect(70f, 70f, 460f, 604f);
+    private Rect windowRect = new Rect(70f, 40f, 470f, 660f);
 
     private Texture2D panelTex;
     private Texture2D accentTex;
@@ -759,6 +1388,7 @@ public class DifMenuBehaviour : MonoBehaviour
     private GUIStyle valueStyle;
     private GUIStyle buttonStyle;
     private GUIStyle toggleStyle;
+    private GUIStyle warnStyle;
 
     private void Update()
     {
@@ -840,6 +1470,8 @@ public class DifMenuBehaviour : MonoBehaviour
         GUI.DrawTexture(new Rect(0f, 0f, w, 3f), accentTex, ScaleMode.StretchToFill);
         GUI.DrawTexture(new Rect(0f, h - 1f, w, 1f), accentTex, ScaleMode.StretchToFill);
 
+        bool locked = RustSettings.Forced;
+
         float y = 12f;
         GUI.Label(new Rect(18f, y, w - 70f, 26f), "DIFRUST", titleStyle);
 
@@ -853,6 +1485,7 @@ public class DifMenuBehaviour : MonoBehaviour
         GUI.DrawTexture(new Rect(18f, y, w - 36f, 1f), rowTex, ScaleMode.StretchToFill);
         y += 14f;
 
+        GUI.enabled = !locked;
         {
             bool was = RustSettings.Enabled;
             RustSettings.Enabled = GUI.Toggle(
@@ -863,6 +1496,7 @@ public class DifMenuBehaviour : MonoBehaviour
             );
             if (was != RustSettings.Enabled) { RustSettings.MarkDirty(); RustSettings.Save(); }
         }
+        GUI.enabled = true;
 
         y += 34f;
 
@@ -871,6 +1505,7 @@ public class DifMenuBehaviour : MonoBehaviour
             RustText.T("PRESETS", "ПРЕСЕТЫ"), labelStyle);
         y += 22f;
 
+        GUI.enabled = RustSettings.Enabled && !locked;
         {
             float bw = (w - 36f - 8f) / 3f;
             if (GUI.Button(new Rect(18f, y, bw, 26f), RustText.T("Soft", "Мягкая"), buttonStyle))
@@ -880,9 +1515,75 @@ public class DifMenuBehaviour : MonoBehaviour
             if (GUI.Button(new Rect(18f + (bw + 4f) * 2f, y, bw, 26f), RustText.T("Rust", "Rust"), buttonStyle))
                 RustSettings.ApplyPreset(2);
         }
+        GUI.enabled = true;
         y += 36f;
 
-        GUI.enabled = RustSettings.Enabled;
+        // Тумблеры эффектов 1.5.0: без новых ползунков.
+        GUI.Label(new Rect(18f, y, w - 36f, 20f),
+            RustText.T("EFFECTS", "ЭФФЕКТЫ"), labelStyle);
+        y += 22f;
+
+        float colW = (w - 36f - 8f) / 2f;
+        GUI.enabled = RustSettings.Enabled && !locked;
+
+        ToggleAt(18f, y, colW, ref RustSettings.WeatherOn,
+            RustText.T("  Weather", "  Погода"));
+        ToggleAt(18f + colW + 8f, y, colW, ref RustSettings.EyeAdapt,
+            RustText.T("  Eye adapt", "  Глаза"));
+
+        y += 24f;
+        ToggleAt(18f, y, colW, ref RustSettings.LightRelief,
+            RustText.T("  Flashlight/fire", "  Фонарь/огонь"));
+        ToggleAt(18f + colW + 8f, y, colW, ref RustSettings.BiomeTintOn,
+            RustText.T("  Biome tint", "  Биомы"));
+
+        y += 24f;
+        ToggleAt(18f, y, colW, ref RustSettings.LunarLink,
+            RustText.T("  LunarEvents", "  LunarEvents"));
+        GUI.enabled = true;
+
+        y += 26f;
+
+        string conflict = RustConflicts.Name;
+        if (!string.IsNullOrEmpty(conflict))
+        {
+            GUI.Label(new Rect(18f, y, w - 36f, 20f),
+                string.Format(RustText.T(
+                    "Conflict: {0} also darkens nights, effects stack.",
+                    "Конфликт: {0} тоже затемняет ночь, эффекты складываются."),
+                    conflict),
+                warnStyle);
+        }
+        y += 22f;
+
+        // Серверный замок: только хост решает, применять ли настройки всем.
+        if (RustSettings.IsHost)
+        {
+            GUI.enabled = RustSettings.Enabled;
+            bool wasForce = RustSettings.ForceForClients;
+            RustSettings.ForceForClients = GUI.Toggle(
+                new Rect(18f, y, w - 36f, 24f),
+                RustSettings.ForceForClients,
+                RustText.T("  Host lock: same night for all players",
+                           "  Замок хоста: одна ночь для всех"),
+                toggleStyle);
+            if (wasForce != RustSettings.ForceForClients)
+            {
+                RustSettings.MarkDirty();
+                RustSettings.Save();
+            }
+            GUI.enabled = true;
+        }
+        else if (locked)
+        {
+            GUI.Label(new Rect(18f, y, w - 36f, 22f),
+                RustText.T("Host controls these settings.",
+                           "Настройки задаёт хост."), labelStyle);
+        }
+
+        y += 30f;
+
+        GUI.enabled = RustSettings.Enabled && !locked;
         GUI.Label(new Rect(18f, y, w - 130f, 20f), RustText.T("Darkness", "Сила тьмы"), labelStyle);
         GUI.Label(new Rect(w - 110f, y, 92f, 20f),
             Mathf.RoundToInt(RustSettings.NightFactorValue * 100f) + "%", valueStyle);
@@ -901,15 +1602,7 @@ public class DifMenuBehaviour : MonoBehaviour
             RustSettings.Save();
         }
 
-        GUI.enabled = true;
         y += 46f;
-
-        GUI.Label(new Rect(18f, y, w - 36f, 20f),
-            RustText.T(
-                "Lower is darker. 6% = almost pitch black, 30% = soft night.",
-                "Меньше — темнее. 6% — почти полная тьма, 30% — мягкая ночь."),
-            hintStyle);
-        y += 26f;
 
         // Ярче в помещениях.
         GUI.Label(new Rect(18f, y, w - 130f, 20f),
@@ -966,31 +1659,31 @@ public class DifMenuBehaviour : MonoBehaviour
             RustSettings.Save();
         }
 
+        GUI.enabled = true;
         y += 46f;
 
-        GUI.Label(new Rect(18f, y, w - 36f, 20f),
+        GUI.Label(new Rect(18f, y, w - 36f, 40f),
             RustText.T(
-                "Moon: 0% = every night alike, 100% = full moon bright, new moon black.",
-                "Луна: 0% — все ночи одинаковые, 100% — полная светлая, новая почти чёрная."),
+                "Lower is darker. 6% = almost pitch black, 30% = soft night. " +
+                "Presets and settings blend smoothly.",
+                "Меньше — темнее. 6% — почти полная тьма, 30% — мягкая ночь. " +
+                "Пресеты и настройки меняются плавно."),
             hintStyle);
-        y += 22f;
-
-        GUI.Label(new Rect(18f, y, w - 36f, 20f),
-            RustText.T(
-                "Indoors: 0% = same as outside, 100% = almost daylight.",
-                "Помещения: 0% — как снаружи, 100% — почти дневной свет."),
-            hintStyle);
-        y += 22f;
+        y += 42f;
 
         if (GUI.Button(new Rect(18f, y, 180f, 30f),
             RustText.T("Night now (30 s)", "Ночь сейчас (30 с)"), buttonStyle))
         {
             RustLighting.ForceNight(30f);
         }
+
+        GUI.enabled = !locked;
         if (GUI.Button(new Rect(206f, y, 90f, 30f), RustText.T("Reset", "Сбросить"), buttonStyle))
         {
             RustSettings.Reset();
         }
+        GUI.enabled = true;
+
         if (GUI.Button(new Rect(304f, y, w - 322f, 30f), RustText.T("Close", "Закрыть"), buttonStyle))
         {
             Close();
@@ -1007,30 +1700,64 @@ public class DifMenuBehaviour : MonoBehaviour
             : string.Format("{0:00}:{1:00}", Mathf.FloorToInt(clock),
                 Mathf.FloorToInt((clock - Mathf.Floor(clock)) * 60f));
 
+        string dawn = RustLighting.DawnText();
+        string dawnText = string.IsNullOrEmpty(dawn)
+            ? ""
+            : RustText.T("  ·  dawn in " + dawn, "  ·  до рассвета " + dawn);
+
         string demo = RustLighting.DemoActive
             ? string.Format(RustText.T("  ·  demo {0} s", "  ·  демо {0} с"),
                 Mathf.CeilToInt(RustLighting.DemoRemaining))
             : "";
 
+        string lockText = locked
+            ? RustText.T("  ·  host lock", "  ·  замок хоста")
+            : "";
+
         GUI.Label(
-            new Rect(18f, y, w - 36f, 40f),
+            new Rect(18f, y, w - 36f, 20f),
             string.Format(
-                RustText.T("Mode: {0}  ·  time {1}  ·  darkness {2}%  ·  moon {3} {4}{5}",
-                           "Режим: {0}  ·  время {1}  ·  тьма {2}%  ·  луна {3} {4}{5}"),
+                RustText.T("Mode: {0}  ·  time {1}  ·  darkness {2}%{3}{4}",
+                           "Режим: {0}  ·  время {1}  ·  тьма {2}%{3}{4}"),
                 RustLighting.ModeName(),
                 clockText,
                 Mathf.RoundToInt(RustLighting.GetFactor() * 100f),
-                RustLighting.MoonName(),
-                RustLighting.MoonMulText(),
+                dawnText,
                 demo),
             hintStyle
         );
 
-        y += 34f;
+        y += 20f;
+
+        GUI.Label(
+            new Rect(18f, y, w - 36f, 20f),
+            string.Format(
+                RustText.T("Moon: {0} {1}  ·  weather: {2}  ·  biome: {3}{4}",
+                           "Луна: {0} {1}  ·  погода: {2}  ·  биом: {3}{4}"),
+                RustLighting.MoonName(),
+                RustLighting.MoonMulText(),
+                RustLighting.WeatherName(),
+                RustLighting.BiomeName(),
+                lockText),
+            hintStyle
+        );
+
+        y += 22f;
         GUI.Label(new Rect(18f, y, w - 36f, 20f),
             RustText.T("NumPad6 / F8 = open menu", "NumPad6 / F8 — открыть меню"), hintStyle);
 
         GUI.DragWindow(new Rect(0f, 0f, w, 40f));
+    }
+
+    private void ToggleAt(float x, float y, float width, ref bool value, string label)
+    {
+        bool was = value;
+        value = GUI.Toggle(new Rect(x, y, width, 22f), value, label, toggleStyle);
+        if (was != value)
+        {
+            RustSettings.MarkDirty();
+            RustSettings.Save();
+        }
     }
 
     private void EnsureStyles()
@@ -1060,6 +1787,14 @@ public class DifMenuBehaviour : MonoBehaviour
             fontSize = 12,
             wordWrap = true,
             normal = { textColor = new Color(0.66f, 0.62f, 0.6f) }
+        };
+
+        warnStyle = new GUIStyle(GUI.skin.label)
+        {
+            fontSize = 12,
+            wordWrap = true,
+            fontStyle = FontStyle.Bold,
+            normal = { textColor = new Color(1f, 0.62f, 0.42f) }
         };
 
         valueStyle = new GUIStyle(GUI.skin.label)

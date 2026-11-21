@@ -2,9 +2,9 @@
 <xml>
   <Name value="DifRUST" />
   <DisplayName value="DifRUST - Rust Nights" />
-  <Description value="Rust-style nights: gradual dusk 20:00, full darkness 22:00-04:00, dawn 04:00-06:00. Brighter indoors, cold night tint, moon phases, three presets, host settings synced to all players. Menu NumPad6/F8. Client-side only, no fog changes. | Rust-стиль ночи: плавный закат с 20:00, полная тьма 22:00-04:00, рассвет 04:00-06:00. В помещениях светлее, холодный оттенок ночи, фазы луны, три пресета, настройки хоста раздаются всем игрокам. Меню NumPad6/F8. Только освещение, туман не меняется." />
+  <Description value="Rust-style nights: sunset 20:00, darkness 22:00-04:00, dawn 04:00-06:00. Weather and clouds affect moonlight, optional LunarEvents phase link, smooth transitions, eye adaptation, NVG/flashlight/fire relief, biome night tint matching Silent Fog, dawn timer, host lock. Menu NumPad6/F8. Client-side only, no fog or weather changes. | Rust-стиль ночи: закат с 20:00, тьма 22:00-04:00, рассвет 04:00-06:00. Погода и облака влияют на лунный свет, необязательная связка с LunarEvents, плавные переходы, адаптация глаз, ПНВ/фонарь/костёр, биомный оттенок как у Silent Fog, таймер до рассвета, замок хоста. Меню NumPad6/F8. Только освещение, туман и погода не меняются." />
   <Author value="DifRUST" />
-  <Version value="1.4.2" />
+  <Version value="1.5.0" />
   <Website value="https://github.com/Lesnoy87/difrust-client" />
   <SkipWithAntiCheat value="true" />
 </xml>

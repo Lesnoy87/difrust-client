@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.5.0
+
+- Weather and clouds now affect night lighting: clear nights are brighter,
+  overcast/rain/snow/storms darker (never fully black). Weather is read only.
+- Optional LunarEvents link: the moon phase is taken from `lunar_*` night buffs
+  when present; otherwise `day % 8` is used as before.
+- Smooth transitions for presets, toggles and settings (about 1 s).
+- Eye adaptation: 2.4 s to get used to darkness, 1.1 s back to light.
+- NVG raises the darkness floor to 0.35; a held flashlight or nearby
+  campfire/torch/lamp to 0.14.
+- Biome night tint using the same palette as Silent Fog (snow, desert,
+  radiated, wasteland, burnt forest); neutral biomes are untouched.
+- Dawn timer in the status line (game time until 06:00).
+- Host sync covers all settings; new Host lock option (analog of `sf_force`).
+  Without the lock each player keeps their own settings.
+- Menu conflict warning when another night-darkening mod is loaded.
+- New config keys: `weather`, `eyes`, `light`, `nvg`, `biome`, `biome_amount`,
+  `lunar`, `force`; new CVars: `dr_force`, `dr_weather`, `dr_eyes`, `dr_light`,
+  `dr_biome`, `dr_biome_amt`, `dr_lunar`.
+
 ## 1.4.2
 
 - License changed from MIT to All Rights Reserved / source-available
