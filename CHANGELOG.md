@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.2
+
+- License changed from MIT to All Rights Reserved / source-available
+  (`LICENSE`, `LICENSE-RU.md`). Versions 1.4.1 and earlier remain MIT.
+- No gameplay or lighting changes.
+
 ## 1.4.1
 
 - Cold night tint fixed: it now applies to the moonlight itself instead of

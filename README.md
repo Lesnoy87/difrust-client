@@ -1,4 +1,4 @@
-# DifRUST — Rust Nights 1.4.1
+# DifRUST — Rust Nights 1.4.2
 
 Client-side lighting mod for 7 Days to Die 3.4.x. Only lighting is changed: fog,
 weather, zombies, loot, progression and network logic are untouched.
@@ -68,7 +68,7 @@ assets, models, voices or textures are included.
 
 ---
 
-# DifRUST — Rust Nights 1.4.1 (RU)
+# DifRUST — Rust Nights 1.4.2 (RU)
 
 Клиентский мод освещения для 7 Days to Die 3.4.x. Меняется только свет: туман,
 погода, зомби, лут, прокачка и сеть не затронуты.
@@ -129,3 +129,11 @@ assets, models, voices or textures are included.
 - Не требует RustNightMod или RustNightClient.
 - Если другой клиентский мод тоже затемняет ночь, эффекты складываются — используйте один.
 - Хорошо сочетается с Silent Fog: тот ослабляет ночной туман, если DifRUST установлен.
+
+## Лицензия
+
+С версии **1.4.2** DifRUST распространяется как **All Rights Reserved /
+source-available**, не MIT. Бесплатно играть и включать немодифицированный
+мод в бесплатные модпаки с указанием автора «Lesnoy87 / DifRUST» можно;
+продажа, перезалив и изменение — нельзя. Полный текст: `LICENSE`, кратко
+по-русски: `LICENSE-RU.md`. Версии **1.4.1 и раньше** остаются под MIT.
