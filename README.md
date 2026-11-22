@@ -1,4 +1,4 @@
-# DifRUST — Rust Nights 1.5.1
+# DifRUST — Rust Nights 1.5.4
 
 Client-side lighting mod for 7 Days to Die 3.4.x. Only lighting is changed: fog,
 weather, zombies, loot, progression and network logic are untouched.
@@ -11,6 +11,21 @@ weather, zombies, loot, progression and network logic are untouched.
 | 22:00–04:00 | full darkness |
 | 04:00–06:00 | gradual dawn |
 | 06:00–20:00 | normal lighting |
+
+## What's new in 1.5.4
+
+- **"Brighter indoors" no longer triggers outdoors.** A room now needs a roof
+  *and* at least two of four sides blocked by solid blocks (plants ignored):
+  2 sides = 50 %, 3 = 80 %, 4 = 100 %. Balconies, overhangs and tree canopies
+  no longer brighten the night outside.
+- **Ambient floor (1.5.2).** Each ambient channel is kept at no less than 25 %
+  of the brightest one, so a config that zeroes a channel (ProjectZ used
+  `ambientGroundScale = .2,0`) cannot make the slider invisible there.
+  DifRUST no longer depends on ProjectZ lighting and works on vanilla scales.
+- **Raw ambient channels in the menu:** `Ambient: sky .70 · equator .45 ·
+  ground .05` — shows what the renderer actually receives.
+- **Eye adaptation is exponential (1.5.3):** 2.4 s into darkness, 1.1 s toward
+  light, so stepping out of a lit base no longer reads as an instant switch.
 
 ## What's new in 1.5.1
 
@@ -123,7 +138,7 @@ assets, models, voices or textures are included.
 
 ---
 
-# DifRUST — Rust Nights 1.5.1 (RU)
+# DifRUST — Rust Nights 1.5.4 (RU)
 
 Клиентский мод освещения для 7 Days to Die 3.4.x. Меняется только свет: туман,
 погода, зомби, лут, прокачка и сеть не затронуты.
@@ -136,6 +151,20 @@ assets, models, voices or textures are included.
 | 22:00–04:00 | полная тьма |
 | 04:00–06:00 | плавный рассвет |
 | 06:00–20:00 | обычный свет |
+
+## Что нового в 1.5.4
+
+- **«Светлее в помещении» больше не срабатывает на улице.** Комнатой считается
+  место с крышей **и** минимум двумя закрытыми из четырёх сторон блоками
+  (растения не считаются): 2 стороны = 50 %, 3 = 80 %, 4 = 100 %. Балконы,
+  навесы и кроны деревьев больше не подсвечивают ночь снаружи.
+- **Пол по ambient (1.5.2).** Каждый канал не опускается ниже 25 % от самого
+  яркого, поэтому конфиг, обнуляющий канал (ProjectZ: `ambientGroundScale = .2,0`),
+  больше не делает ползунок невидимым. ProjectZ-освещение больше не нужно,
+  DifRUST работает на ванильных шкалах.
+- **В меню видны сырые каналы:** `Ambient: небо .70 · экватор .45 · земля .05`.
+- **Адаптация глаз экспоненциальная (1.5.3):** 2.4 с в темноту, 1.1 с к свету —
+  выход из освещённой базы больше не выглядит мгновенным переключением.
 
 ## Что нового в 1.5.1
 

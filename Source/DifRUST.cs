@@ -757,9 +757,14 @@ internal static class RustLighting
         else
         {
             // В темноту глаза привыкают 2.4 с, к свету — 1.1 с.
+            // Экспоненциальное приближение, а не линейное: линейный шаг
+            // съедал почти всю видимую разницу за первые 0.4 с, и переход
+            // читался как мгновенное переключение.
             float seconds = factorTarget < factorCurrent ? 2.4f : 1.1f;
-            factorCurrent = Mathf.MoveTowards(
-                factorCurrent, factorTarget, Time.deltaTime / seconds);
+            float blend = 1f - Mathf.Exp(-Time.deltaTime / seconds);
+            factorCurrent = Mathf.Lerp(factorCurrent, factorTarget, blend);
+            if (Mathf.Abs(factorCurrent - factorTarget) < 0.002f)
+                factorCurrent = factorTarget;
         }
 
         initialized = true;
@@ -1147,7 +1152,8 @@ internal static class NightIndoor
             for (int dy = 2; dy <= 8; dy++)
             {
                 BlockValue bv = world.GetBlock(p.x, p.y + dy, p.z);
-                if (bv.isair) continue;
+                if (bv.isair || bv.Block == null) continue;
+                if (bv.Block is BlockPlant) continue;   // крона/куст — не крыша
 
                 covered[i] = true;
                 hits++;
@@ -1157,7 +1163,40 @@ internal static class NightIndoor
 
         if (!covered[0]) return 0f;
 
-        return hits / 5f;
+        // Крыша без стен — это навес, балкон или лес, а не помещение.
+        // Раньше проверялись только лучи вверх, и «ярче в помещениях»
+        // работало на улице под любой кроной.
+        Vector3i eye = World.worldToBlockPos(pos + new Vector3(0f, 1.2f, 0f));
+        int walls = Walls(world, eye);
+        if (walls <= 1) return 0f;
+
+        float enclosure = walls == 2 ? 0.5f : (walls == 3 ? 0.8f : 1f);
+        return (hits / 5f) * enclosure;
+    }
+
+    // Сколько из четырёх сторон (С/Ю/З/В) перекрыто твёрдым блоком
+    // в пределах 10 блоков на уровне глаз.
+    private static int Walls(World world, Vector3i p)
+    {
+        int n = 0;
+
+        for (int d = 0; d < 4; d++)
+        {
+            int dx = d == 0 ? 1 : (d == 1 ? -1 : 0);
+            int dz = d == 2 ? 1 : (d == 3 ? -1 : 0);
+
+            for (int r = 1; r <= 10; r++)
+            {
+                BlockValue bv = world.GetBlock(p.x + dx * r, p.y, p.z + dz * r);
+                if (bv.isair || bv.Block == null) continue;
+                if (bv.Block is BlockPlant) continue;
+
+                n++;
+                break;
+            }
+        }
+
+        return n;
     }
 }
 
@@ -1424,6 +1463,14 @@ internal static class AmbientLightPatch
         RustSettings.ReadFromLocalPlayer(player);
         RustSettings.Tick();
 
+        // Сырые ванильные цвета — до нашего затемнения. Нужны и для пола,
+        // и для диагностики в меню.
+        Color rawSky = RenderSettings.ambientSkyColor;
+        Color rawEquator = RenderSettings.ambientEquatorColor;
+        Color rawGround = RenderSettings.ambientGroundColor;
+        Color rawLight = RenderSettings.ambientLight;
+        AmbientProbe.Set(rawSky, rawEquator, rawGround);
+
         float factor = RustLighting.GetFactor();
 
         if (factor >= 0.999f)
@@ -1445,10 +1492,19 @@ internal static class AmbientLightPatch
         // Если сцена была в Skybox-режиме, цвета ambient игнорируются.
         // На ночь принудительно включаем Trilight, чтобы затемнение работало.
         RenderSettings.ambientMode = AmbientMode.Trilight;
-        RenderSettings.ambientSkyColor *= factor;
-        RenderSettings.ambientEquatorColor *= factor;
-        RenderSettings.ambientGroundColor *= factor;
-        RenderSettings.ambientLight *= factor;
+
+        // Пол: каждый канал не ниже доли самого яркого канала сцены,
+        // умноженной на тот же factor. Так канал, обнулённый чужим
+        // конфигом (ProjectZ ставил ambientGroundScale = .2,0), всё равно
+        // следует за ползунком, но остаётся темнее неба.
+        float peak = Mathf.Max(Peak(rawSky),
+            Mathf.Max(Peak(rawEquator), Peak(rawGround)));
+        float lift = peak * factor * FloorShare;
+
+        RenderSettings.ambientSkyColor = Darken(rawSky, factor, lift);
+        RenderSettings.ambientEquatorColor = Darken(rawEquator, factor, lift);
+        RenderSettings.ambientGroundColor = Darken(rawGround, factor, lift);
+        RenderSettings.ambientLight = Darken(rawLight, factor, lift);
 
         // Ночной оттенок: чем глубже ночь, тем холоднее свет.
         float tintAmount = RustLighting.TintAmount();
@@ -1479,6 +1535,40 @@ internal static class AmbientLightPatch
             RenderSettings.ambientSkyColor += floor * 1.4f;
             RenderSettings.ambientEquatorColor += floor;
         }
+    }
+
+    // Доля самого яркого канала, ниже которой канал не опускается.
+    // 0.25 — земля остаётся заметно темнее неба, но реагирует на ползунок.
+    private const float FloorShare = 0.25f;
+
+    private static float Peak(Color c)
+    {
+        return Mathf.Max(c.r, Mathf.Max(c.g, c.b));
+    }
+
+    private static Color Darken(Color raw, float factor, float lift)
+    {
+        Color c = raw * factor;
+        c.r = Mathf.Max(c.r, lift);
+        c.g = Mathf.Max(c.g, lift);
+        c.b = Mathf.Max(c.b, lift);
+        c.a = raw.a;
+        return c;
+    }
+}
+
+// Сырые ванильные каналы ambient — для диагностики в меню.
+internal static class AmbientProbe
+{
+    public static float Sky;
+    public static float Equator;
+    public static float Ground;
+
+    public static void Set(Color sky, Color equator, Color ground)
+    {
+        Sky = Mathf.Max(sky.r, Mathf.Max(sky.g, sky.b));
+        Equator = Mathf.Max(equator.r, Mathf.Max(equator.g, equator.b));
+        Ground = Mathf.Max(ground.r, Mathf.Max(ground.g, ground.b));
     }
 }
 
@@ -1578,7 +1668,7 @@ public class DifMenuBehaviour : MonoBehaviour
     }
 
     private bool open;
-    private Rect windowRect = new Rect(70f, 40f, 470f, 660f);
+    private Rect windowRect = new Rect(70f, 40f, 470f, 682f);
 
     private Texture2D panelTex;
     private Texture2D accentTex;
@@ -1957,6 +2047,16 @@ public class DifMenuBehaviour : MonoBehaviour
                 RustLighting.WeatherName(),
                 RustLighting.BiomeName(),
                 lockText),
+            hintStyle
+        );
+
+        y += 20f;
+        GUI.Label(
+            new Rect(18f, y, w - 36f, 20f),
+            string.Format(
+                RustText.T("Ambient: sky {0:0.00}  ·  equator {1:0.00}  ·  ground {2:0.00}",
+                           "Ambient: небо {0:0.00}  ·  экватор {1:0.00}  ·  земля {2:0.00}"),
+                AmbientProbe.Sky, AmbientProbe.Equator, AmbientProbe.Ground),
             hintStyle
         );
 

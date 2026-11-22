@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.5.4
+
+- "Brighter indoors" no longer triggers outdoors. Roof detection used to look
+  only up, so a balcony, an overhang or a tree canopy counted as a room and
+  the night outside was boosted to ~50 %. Now a room needs a roof **and** at
+  least two of four sides blocked by solid blocks (plants ignored):
+  2 sides = 50 %, 3 = 80 %, 4 = 100 %.
+
+## 1.5.3
+
+- Eye adaptation is exponential instead of linear. With the ambient floor in
+  place the linear ramp burned most of the visible difference in the first
+  ~0.4 s, so stepping out of a lit base read as an instant switch. Now the
+  eye keeps settling (2.4 s into darkness, 1.1 s toward light).
+
+## 1.5.2
+
+- Ambient darkening now has an absolute floor per channel: each channel is
+  kept at no less than 25% of the brightest channel, scaled by the same
+  darkness factor. A config that zeroes a channel (ProjectZ used
+  `ambientGroundScale = .2,0`) can no longer make the slider invisible there.
+- Removed the dependency on ProjectZ lighting: ProjectZ's `worldglobal.xml`
+  is disabled, so DifRUST works on vanilla ambient scales.
+- Menu shows the raw vanilla ambient channels
+  (`Ambient: sky .70 · equator .45 · ground .05`) to verify what a mod or
+  config actually feeds the renderer.
+
 ## 1.5.1
 
 - Host lock now requires a live heartbeat (`dr_seq`); if the host stops sending
