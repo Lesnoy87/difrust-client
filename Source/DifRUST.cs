@@ -1,9 +1,12 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
+using System.Text;
 using HarmonyLib;
 using UnityEngine;
+using UnityEngine.Experimental.Rendering;
 using UnityEngine.Rendering;
 
 // DifRUST — только освещение. Клиентский мод.
@@ -18,6 +21,13 @@ public class DifRUSTMod : IModApi
         // мод останется управляемым и запишет ошибку в лог.
         RustSettings.Load();
         DifMenu.Create();
+
+        // Ночное небо 1.6.0: кубмапа + луна, мягкая связка с LunarEvents.
+        DifSkyAssets.Root = Path.Combine(_modInstance.Path, "Assets", "Sky");
+        DifSky.Create();
+
+        // Диагностика неба: только чтение и лог, визуально ничего не меняет.
+        DifSkyDiag.Create();
 
         try
         {
@@ -79,6 +89,12 @@ internal static class RustSettings
     public static bool LunarLink = true;
     public static bool ForceForClients = true;
     public static float BiomeTintValue = DefaultBiomeTint;
+
+    // 1.6.0: ночное небо. Косметика клиента — с хостом не синхронизируется.
+    public static bool SkyOn = true;
+    public static float SkyAmount = 1f;
+    public static bool SkyMoon = true; // вторая луна: каждую ночь, ярче в особую
+    public static bool SkyMesh = true;
 
     // CVar-имена: хост раздаёт настройки ванильным NetPackageModifyCVar.
     public const string CvarEnabled = "dr_on";
@@ -178,6 +194,10 @@ internal static class RustSettings
                 else if (key == "biome_amount") BiomeTintValue = Mathf.Clamp01(num);
                 else if (key == "lunar") LunarLink = num >= 0.5f;
                 else if (key == "force") ForceForClients = num >= 0.5f;
+                else if (key == "sky") SkyOn = num >= 0.5f;
+                else if (key == "sky_amt") SkyAmount = Mathf.Clamp(num, 0.3f, 1.5f);
+                else if (key == "sky_moon") SkyMoon = num >= 0.5f;
+                else if (key == "sky_mesh") SkyMesh = num >= 0.5f;
             }
         }
         catch
@@ -220,11 +240,14 @@ internal static class RustSettings
                 System.Globalization.CultureInfo.InvariantCulture,
                 "enabled={0}\nnight={1}\nindoor={2}\ntint={3}\nmoon={4}\n" +
                 "weather={5}\neyes={6}\nlight={7}\nnvg={8}\nbiome={9}\n" +
-                "biome_amount={10}\nlunar={11}\nforce={12}\n",
+                "biome_amount={10}\nlunar={11}\nforce={12}\n" +
+                "sky={13}\nsky_amt={14}\nsky_moon={15}\nsky_mesh={16}\n",
                 Enabled ? "1" : "0", NightFactorValue, IndoorBoost, NightTint, MoonPhases,
                 WeatherOn ? "1" : "0", EyeAdapt ? "1" : "0", LightRelief ? "1" : "0",
                 NvgRelief ? "1" : "0", BiomeTintOn ? "1" : "0", BiomeTintValue,
-                LunarLink ? "1" : "0", ForceForClients ? "1" : "0");
+                LunarLink ? "1" : "0", ForceForClients ? "1" : "0",
+                SkyOn ? "1" : "0", SkyAmount, SkyMoon ? "1" : "0",
+                SkyMesh ? "1" : "0");
             File.WriteAllText(SettingsPath, text);
         }
         catch
@@ -247,6 +270,10 @@ internal static class RustSettings
         BiomeTintValue = DefaultBiomeTint;
         LunarLink = true;
         ForceForClients = true;
+        SkyOn = true;
+        SkyAmount = 1f;
+        SkyMoon = true;
+        SkyMesh = true;
         MarkDirty();
         Save();
     }
@@ -1658,6 +1685,1637 @@ internal static class DifMenu
     }
 }
 
+// Ночное небо 1.6.0: кубмапа Млечного Пути + своя луна.
+// Луна — мягкая связка с LunarEvents: без него остаётся ванильная,
+// небо при этом работает само по себе.
+internal static class DifSky
+{
+    // Ванильная яркость кубмапы; наша калибруется этим же числом.
+    public const float BaseStrength = 0.32f;
+
+    // Вторая луна: та же сфера, что и ванильная, но чуть меньше и по своей
+    // орбите — выше и в стороне, чтобы не сливаться с ванильной.
+    private const float MoonDistance = 45000f;
+    private const float SecondMoonScale = 0.58f;
+    private const float SecondMoonLift = 0.50f;    // ~28,6° к зениту
+    private const float SecondMoonAzimuth = 0.35f; // ~20° по азимуту
+
+    public static Cubemap Cube;
+    public static Texture2D Moon;
+
+    public static bool LunarEventsPresent { get; private set; }
+    public static bool LunarApiAvailable { get { return lunarSpecial != null; } }
+    public static string SecondMoonSpecial { get; private set; }
+    public static bool SecondMoonActive
+    {
+        get { return !string.IsNullOrEmpty(SecondMoonSpecial); }
+    }
+    public static bool CubeReady { get { return Cube != null; } }
+    public static bool SkyActive { get { return appliedSky; } }
+    public static bool SkyYielded { get { return yieldedSky; } }
+
+    private static Material atmo;
+    private static Texture origCube;
+    private static float origStrength;
+    private static bool haveCube;
+    private static bool appliedSky;
+    private static bool yieldedSky;
+
+    private static bool lunarChecked;
+    private static float nextLunarCheck;
+    private static MethodInfo lunarSpecial;
+    private static bool lunarApiWarned;
+
+    private static Transform moonSource;
+    private static Transform secondMoon;
+    private static Renderer secondRenderer;
+    private static Material secondMoonMat;
+    private static int moonNightDay = int.MinValue;
+    private static string moonSpecialLogged;
+    private static float nextMoonNightCheck;
+
+    public static void Create()
+    {
+        try
+        {
+            GameObject go = new GameObject("DifRUSTSky");
+            UnityEngine.Object.DontDestroyOnLoad(go);
+            go.hideFlags = HideFlags.HideAndDontSave;
+            go.AddComponent<DifSkyBehaviour>();
+        }
+        catch (Exception e)
+        {
+            Debug.LogError("[DifRUST][sky] create failed: " + e);
+        }
+    }
+
+    public static void Tick()
+    {
+        try
+        {
+            if (!lunarChecked || Time.unscaledTime >= nextLunarCheck)
+            {
+                nextLunarCheck = Time.unscaledTime + 5f;
+                lunarChecked = true;
+                LunarEventsPresent = DetectLunarEvents();
+
+                // LunarEvents мог загрузиться позже нас: ищем API, пока нет.
+                if (lunarSpecial == null) DetectLunarApi();
+            }
+
+            TickCube();
+            TickSecondMoon();
+            DifSkyLayers.Tick();
+            DifSkyMesh.Tick();
+        }
+        catch (Exception e)
+        {
+            Debug.LogError("[DifRUST][sky] tick failed: " + e);
+            Restore();
+        }
+    }
+
+    private static void TickCube()
+    {
+        Material m = SkyManager.atmosphereMtrl;
+        if (m == null) return;
+
+        if (!ReferenceEquals(m, atmo))
+        {
+            atmo = m;
+            origCube = m.GetTexture("_OuterSpaceCube");
+            origStrength = m.GetFloat("_StarStrength");
+            haveCube = true;
+            appliedSky = false;
+            yieldedSky = false;
+        }
+        if (!haveCube) return;
+
+        Texture cur = m.GetTexture("_OuterSpaceCube");
+
+        // Чужой мод поставил свою кубмапу — уступаем, не воюем.
+        if (cur != null && !ReferenceEquals(cur, Cube)
+            && !ReferenceEquals(cur, origCube))
+        {
+            if (!yieldedSky)
+                Debug.Log("[DifRUST][sky] cubemap changed by another mod, yielding");
+            yieldedSky = true;
+            return;
+        }
+
+        bool want = RustSettings.SkyOn && Cube != null && !yieldedSky;
+
+        if (want)
+        {
+            if (!ReferenceEquals(cur, Cube))
+                m.SetTexture("_OuterSpaceCube", Cube);
+            m.SetFloat("_StarStrength",
+                BaseStrength * RustSettings.SkyAmount);
+            appliedSky = true;
+        }
+        else if (appliedSky)
+        {
+            m.SetTexture("_OuterSpaceCube", origCube);
+            m.SetFloat("_StarStrength", origStrength);
+            appliedSky = false;
+        }
+    }
+
+    // Вторая луна — отдельный клон ванильного спрайта. Ванильную луну
+    // не трогаем: своя текстура, свой материал, своя позиция на небе.
+    private static void TickSecondMoon()
+    {
+        if (Time.unscaledTime >= nextMoonNightCheck)
+        {
+            nextMoonNightCheck = Time.unscaledTime + 5f;
+            UpdateSecondMoonNight();
+        }
+
+        bool want = RustSettings.SkyOn && RustSettings.SkyMoon && Moon != null;
+
+        if (!want)
+        {
+            HideSecondMoon();
+            return;
+        }
+
+        Transform src = SkyManager.moonSpriteT;
+        if (src == null)
+        {
+            HideSecondMoon();
+            return;
+        }
+
+        EnsureSecondMoon(src);
+        if (secondMoon == null || secondRenderer == null) return;
+
+        // Берём настоящий луч от камеры к ванильной луне: forward квада
+        // смотрит от центра мира, а не от игрока, и на краю карты врёт.
+        Camera cam = SkyManager.mainCamera;
+        Vector3 camPos;
+        Vector3 dir;
+
+        if (cam != null)
+        {
+            camPos = cam.transform.position;
+            dir = (src.position - camPos).normalized;
+        }
+        else
+        {
+            dir = src.forward;
+            camPos = src.position - dir * MoonDistance;
+        }
+
+        // Вторую луну поднимаем к зениту на 28,6° и уводим на 20° в сторону:
+        // она восходит раньше ванильной и никогда с ней не сливается.
+        Vector3 up = Vector3.up;
+        Vector3 tangent = up - dir * Vector3.Dot(up, dir);
+        if (tangent.sqrMagnitude < 0.0001f) tangent = Vector3.forward;
+        tangent.Normalize();
+
+        Vector3 dir2 = (dir * Mathf.Cos(SecondMoonLift)
+            + tangent * Mathf.Sin(SecondMoonLift)).normalized;
+        dir2 = Quaternion.AngleAxis(SecondMoonAzimuth, up) * dir2;
+
+        if (dir2.y < 0.05f)
+        {
+            HideSecondMoon();
+            return;
+        }
+
+        secondMoon.position = camPos + dir2 * MoonDistance;
+        secondMoon.rotation = Quaternion.LookRotation(secondMoon.position, Vector3.up);
+        secondMoon.localScale = src.localScale * SecondMoonScale;
+        if (secondMoonMat != null)
+            secondMoonMat.SetColor("_Color", SecondMoonTint());
+        secondRenderer.enabled = true;
+    }
+
+    private static void EnsureSecondMoon(Transform src)
+    {
+        if (secondMoon != null && ReferenceEquals(moonSource, src)) return;
+        if (SkyManager.moonSpriteMat == null) return;
+
+        DestroySecondMoon();
+        moonSource = src;
+
+        try
+        {
+            GameObject go = UnityEngine.Object.Instantiate(src.gameObject);
+            go.name = "DifRUSTSecondMoon";
+            go.hideFlags = HideFlags.HideAndDontSave;
+            go.SetActive(true);
+            go.transform.SetParent(src.parent, true);
+
+            secondMoon = go.transform;
+            secondRenderer = go.GetComponent<Renderer>();
+            if (secondRenderer == null)
+            {
+                DestroySecondMoon();
+                return;
+            }
+
+            secondRenderer.shadowCastingMode = ShadowCastingMode.Off;
+            secondRenderer.receiveShadows = false;
+            secondRenderer.enabled = false;
+            // У клона может остаться MaterialPropertyBlock от ванильного
+            // рендерера — он перебил бы наш _ColorMap/_LightDir.
+            secondRenderer.SetPropertyBlock(null);
+
+            secondMoonMat = new Material(SkyManager.moonSpriteMat);
+            secondMoonMat.hideFlags = HideFlags.HideAndDontSave;
+            secondMoonMat.SetTexture("_ColorMap", Moon);
+            // Шейдер луны рисует фазу через _LightDir/_Color. Копия не
+            // получает обновления от SkyManager, поэтому фиксируем полную
+            // фазу: вторая луна всегда золотая, а не «чёрная дыра».
+            secondMoonMat.SetVector("_LightDir", new Vector3(0f, 0f, 1f));
+            secondMoonMat.SetColor("_Color", Color.white);
+            secondRenderer.sharedMaterial = secondMoonMat;
+
+            Debug.Log("[DifRUST][sky] second moon created (full phase)");
+        }
+        catch (Exception e)
+        {
+            Debug.LogError("[DifRUST][sky] second moon failed: " + e);
+            DestroySecondMoon();
+        }
+    }
+
+    private static void HideSecondMoon()
+    {
+        if (secondRenderer != null) secondRenderer.enabled = false;
+    }
+
+    private static void UpdateSecondMoonNight()
+    {
+        string special = null;
+
+        try
+        {
+            World w = GameManager.Instance != null
+                ? GameManager.Instance.World : null;
+
+            if (w != null && lunarSpecial != null)
+            {
+                float clock = RustLighting.GetClock();
+                int day = GameUtils.WorldTimeToDays(w.GetWorldTime());
+                int nightDay = clock >= 0f && clock < 4f ? day - 1 : day;
+
+                object res = lunarSpecial.Invoke(
+                    null, new object[] { w.Seed, nightDay });
+                special = res as string;
+
+                if (nightDay != moonNightDay
+                    || !string.Equals(special, moonSpecialLogged))
+                {
+                    moonNightDay = nightDay;
+                    moonSpecialLogged = special;
+                    Debug.Log("[DifRUST][sky] second moon night " + nightDay
+                        + ": " + (string.IsNullOrEmpty(special)
+                            ? "ordinary" : special));
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            if (!lunarApiWarned)
+            {
+                lunarApiWarned = true;
+                Debug.LogWarning("[DifRUST][sky] LunarEvents API call failed: "
+                    + e.Message);
+            }
+        }
+
+        SecondMoonSpecial = string.IsNullOrEmpty(special) ? null : special;
+    }
+
+    public static string SpecialMoonName()
+    {
+        switch (SecondMoonSpecial)
+        {
+            case "lunar_harvest": return RustText.T("Harvest Moon", "Урожайная луна");
+            case "lunar_craft": return RustText.T("Efficient Moon", "Эффективная луна");
+            case "lunar_trade": return RustText.T("Golden Moon", "Золотая луна");
+            case "lunar_travel": return RustText.T("Traveler's Moon", "Луна путешественника");
+            case "lunar_poverty": return RustText.T("Poverty Moon", "Луна бедности");
+            case "lunar_lazy": return RustText.T("Lazy Moon", "Ленивая луна");
+            case "lunar_wild": return RustText.T("Wild Moon", "Дикая луна");
+            case "lunar_fatal": return RustText.T("Fatal Moon", "Фатальная луна");
+            default: return SecondMoonSpecial ?? "";
+        }
+    }
+
+    // Яркость и оттенок второй луны. В обычную ночь — спокойный холодный
+    // свет (но всё равно ярче ванильной), в особую — разгорается и теплеет;
+    // у каждой особой луны свой характер.
+    private static Color SecondMoonTint()
+    {
+        switch (SecondMoonSpecial)
+        {
+            case "lunar_harvest": return new Color(1.12f, 1.02f, 0.82f);
+            case "lunar_craft": return new Color(1.04f, 1.03f, 0.95f);
+            case "lunar_trade": return new Color(1.16f, 1.04f, 0.78f);
+            case "lunar_travel": return new Color(0.92f, 0.99f, 1.12f);
+            case "lunar_poverty": return new Color(0.82f, 0.82f, 0.86f);
+            case "lunar_lazy": return new Color(0.92f, 0.86f, 0.78f);
+            case "lunar_wild": return new Color(1.14f, 0.90f, 0.70f);
+            case "lunar_fatal": return new Color(1.12f, 0.58f, 0.50f);
+            default: return new Color(0.86f, 0.90f, 1.00f);
+        }
+    }
+
+    // Переключение на слоистый вариант: фоновая кубмапа становится ровной,
+    // а сияние и звёзды рисуются отдельными сферами.
+    public static void UseLayeredSky()
+    {
+        if (DifSkyAssets.BaseCube == null) return;
+
+        Cube = DifSkyAssets.BaseCube;
+        appliedSky = true;
+
+        Material m = SkyManager.atmosphereMtrl;
+        if (m != null)
+            m.SetTexture("_OuterSpaceCube", Cube);
+
+        if (DifSkyAssets.FallbackCube != null
+            && !ReferenceEquals(DifSkyAssets.FallbackCube, Cube))
+        {
+            UnityEngine.Object.Destroy(DifSkyAssets.FallbackCube);
+            DifSkyAssets.FallbackCube = null;
+        }
+    }
+
+    public static void Restore()
+    {
+        try
+        {
+            if (atmo != null && haveCube)
+            {
+                atmo.SetTexture("_OuterSpaceCube", origCube);
+                atmo.SetFloat("_StarStrength", origStrength);
+            }
+        }
+        catch
+        {
+        }
+
+        DifSkyLayers.Restore();
+        DifSkyAssets.DestroyAssets();
+        appliedSky = false;
+        DestroySecondMoon();
+        DifSkyMesh.Restore();
+        Cube = null;
+        Moon = null;
+    }
+
+    private static void DestroySecondMoon()
+    {
+        try
+        {
+            if (secondMoon != null)
+                UnityEngine.Object.Destroy(secondMoon.gameObject);
+            if (secondMoonMat != null)
+                UnityEngine.Object.Destroy(secondMoonMat);
+        }
+        catch
+        {
+        }
+
+        secondMoon = null;
+        moonSource = null;
+        secondRenderer = null;
+        secondMoonMat = null;
+    }
+
+    private static bool DetectLunarEvents()
+    {
+        try
+        {
+            return ModManager.ModLoaded("LunarEvents");
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    // Не жёсткая зависимость: ищем публичный LunarEventsApi по имени.
+    // Старый LunarEvents без API просто не даёт второй луны.
+    private static void DetectLunarApi()
+    {
+        try
+        {
+            Assembly[] asms = AppDomain.CurrentDomain.GetAssemblies();
+            for (int i = 0; i < asms.Length; i++)
+            {
+                Type t = asms[i].GetType("LunarEventsApi", false);
+                if (t == null) continue;
+
+                MethodInfo m = t.GetMethod("SpecialForNight",
+                    BindingFlags.Public | BindingFlags.Static);
+                if (m == null || m.ReturnType != typeof(string)) continue;
+
+                ParameterInfo[] ps = m.GetParameters();
+                if (ps.Length != 2
+                    || ps[0].ParameterType != typeof(int)
+                    || ps[1].ParameterType != typeof(int)) continue;
+
+                lunarSpecial = m;
+                Debug.Log("[DifRUST][sky] LunarEvents API found in "
+                    + asms[i].GetName().Name);
+                return;
+            }
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning("[DifRUST][sky] LunarEvents API scan failed: "
+                + e.Message);
+        }
+    }
+}
+
+internal static class DifSkyAssets
+{
+    public static string Root;
+
+    public static Cubemap GlowCube;
+    public static Cubemap StarCube;
+    public static Cubemap BaseCube;
+    public static Cubemap FallbackCube;
+
+    private static readonly string[] Faces =
+        { "px", "nx", "py", "ny", "pz", "nz" };
+
+    public static IEnumerator LoadAll()
+    {
+        if (string.IsNullOrEmpty(Root))
+        {
+            Debug.Log("[DifRUST][sky] assets path is empty, sky disabled");
+            yield break;
+        }
+
+        yield return LoadMoon();
+
+        // Runtime-слои на сфере атмосферы конфликтуют с её композитом
+        // (ZTest Always / отдельный sky-проход): полоса и звёзды уезжают
+        // под горизонт. Пока используем стабильную запечённую кубмапу.
+        bool wantLayers = false;
+        if (wantLayers)
+        {
+            yield return LoadLayerCube("glow", 1024);
+            yield return LoadLayerCube("star", 2048);
+
+            if (GlowCube != null && StarCube != null)
+                BaseCube = CreateBaseCube();
+        }
+
+        // Полная кубмапа — запасной вариант и сразу даёт небо.
+        yield return LoadCube();
+
+        DifSkyLayers.Ready = wantLayers && GlowCube != null && StarCube != null
+            && BaseCube != null;
+        if (DifSkyLayers.Ready) DifSkyLayers.CreateMaterials();
+
+        Debug.Log("[DifRUST][sky] assets: cube=" + (DifSky.Cube != null)
+            + " moon=" + (DifSky.Moon != null)
+            + " layers=" + DifSkyLayers.Active
+            + " glow=" + (GlowCube != null)
+            + " stars=" + (StarCube != null)
+            + " lunar=" + DifSky.LunarEventsPresent);
+    }
+
+    private static IEnumerator LoadLayerCube(string prefix, int expected)
+    {
+        Cubemap cube = null;
+        Texture2D tmp = new Texture2D(2, 2, TextureFormat.RGBA32, false, false);
+
+        for (int f = 0; f < 6; f++)
+        {
+            string file = Path.Combine(Root, prefix + "_" + Faces[f] + ".png");
+            byte[] bytes = null;
+            try { bytes = File.ReadAllBytes(file); } catch { }
+
+            if (bytes == null || !tmp.LoadImage(bytes, false))
+            {
+                Debug.Log("[DifRUST][sky] layer face missing: " + file);
+                if (cube != null) UnityEngine.Object.Destroy(cube);
+                UnityEngine.Object.Destroy(tmp);
+                yield break;
+            }
+
+            int n = tmp.width;
+            if (cube == null)
+            {
+                if (n != tmp.height || n < 64 || n > 2048)
+                {
+                    Debug.Log("[DifRUST][sky] bad layer face size: " + n);
+                    UnityEngine.Object.Destroy(tmp);
+                    yield break;
+                }
+
+                cube = new Cubemap(n, GraphicsFormat.R8G8B8A8_SRGB,
+                    TextureCreationFlags.MipChain);
+            }
+
+            Color32[] src = tmp.GetPixels32();
+            Color32[] dst = new Color32[n * n];
+            for (int y = 0; y < n; y++)
+                Array.Copy(src, y * n, dst, (n - 1 - y) * n, n);
+            cube.SetPixelData(dst, 0, (CubemapFace)f);
+
+            yield return null;
+        }
+
+        UnityEngine.Object.Destroy(tmp);
+        cube.filterMode = FilterMode.Trilinear;
+        cube.wrapMode = TextureWrapMode.Clamp;
+        cube.anisoLevel = 1;
+        cube.hideFlags = HideFlags.HideAndDontSave;
+        cube.Apply(true, true);
+
+        if (prefix == "glow") GlowCube = cube;
+        else StarCube = cube;
+    }
+
+    private static Cubemap CreateBaseCube()
+    {
+        Cubemap cube = new Cubemap(64,
+            GraphicsFormat.R8G8B8A8_SRGB, TextureCreationFlags.MipChain);
+        Color32 col = new Color32(16, 24, 48, 255);
+        Color32[] px = new Color32[64 * 64];
+        for (int i = 0; i < px.Length; i++) px[i] = col;
+
+        for (int f = 0; f < 6; f++)
+            cube.SetPixelData(px, 0, (CubemapFace)f);
+
+        cube.filterMode = FilterMode.Trilinear;
+        cube.wrapMode = TextureWrapMode.Clamp;
+        cube.anisoLevel = 1;
+        cube.hideFlags = HideFlags.HideAndDontSave;
+        cube.Apply(true, true);
+        return cube;
+    }
+
+    private static IEnumerator LoadCube()
+    {
+        Cubemap cube = null;
+        Texture2D tmp = new Texture2D(2, 2, TextureFormat.RGBA32, false, false);
+
+        for (int f = 0; f < 6; f++)
+        {
+            string file = Path.Combine(Root, "mw_" + Faces[f] + ".png");
+            byte[] bytes = null;
+            try { bytes = File.ReadAllBytes(file); } catch { }
+
+            if (bytes == null || !tmp.LoadImage(bytes, false))
+            {
+                Debug.Log("[DifRUST][sky] cube face missing: " + file);
+                if (cube != null) UnityEngine.Object.Destroy(cube);
+                UnityEngine.Object.Destroy(tmp);
+                yield break;
+            }
+
+            int n = tmp.width;
+            if (cube == null)
+            {
+                if (n != tmp.height || n < 64 || n > 2048)
+                {
+                    Debug.Log("[DifRUST][sky] bad cube face size: " + n);
+                    UnityEngine.Object.Destroy(tmp);
+                    yield break;
+                }
+
+                cube = new Cubemap(n, GraphicsFormat.R8G8B8A8_SRGB,
+                    TextureCreationFlags.MipChain);
+            }
+
+            Color32[] src = tmp.GetPixels32();
+            Color32[] dst = new Color32[n * n];
+            for (int y = 0; y < n; y++)
+                Array.Copy(src, y * n, dst, (n - 1 - y) * n, n);
+            cube.SetPixelData(dst, 0, (CubemapFace)f);
+
+            yield return null;
+        }
+
+        UnityEngine.Object.Destroy(tmp);
+        cube.filterMode = FilterMode.Trilinear;
+        cube.wrapMode = TextureWrapMode.Clamp;
+        cube.anisoLevel = 1;
+        cube.hideFlags = HideFlags.HideAndDontSave;
+        cube.Apply(true, true);
+
+        FallbackCube = cube;
+        DifSky.Cube = cube;
+    }
+
+    private static IEnumerator LoadMoon()
+    {
+        string file = Path.Combine(Root, "moon.png");
+        byte[] bytes = null;
+        try { bytes = File.ReadAllBytes(file); } catch { }
+
+        Texture2D tmp = new Texture2D(2, 2, TextureFormat.RGBA32, false, false);
+        if (bytes == null || !tmp.LoadImage(bytes, false))
+        {
+            Debug.Log("[DifRUST][sky] moon missing: " + file);
+            UnityEngine.Object.Destroy(tmp);
+            yield break;
+        }
+
+        int w = tmp.width;
+        int h = tmp.height;
+        Color32[] px = tmp.GetPixels32();
+        UnityEngine.Object.Destroy(tmp);
+
+        Texture2D moon = new Texture2D(w, h, TextureFormat.RGBA32, true, false);
+        moon.SetPixels32(px);
+        moon.filterMode = FilterMode.Trilinear;
+        moon.wrapMode = TextureWrapMode.Clamp;
+        moon.anisoLevel = 4;
+        moon.hideFlags = HideFlags.HideAndDontSave;
+        moon.Apply(true, true);
+        DifSky.Moon = moon;
+
+        yield return null;
+    }
+
+    public static void DestroyAssets()
+    {
+        if (GlowCube != null) UnityEngine.Object.Destroy(GlowCube);
+        if (StarCube != null) UnityEngine.Object.Destroy(StarCube);
+        if (BaseCube != null) UnityEngine.Object.Destroy(BaseCube);
+        if (FallbackCube != null) UnityEngine.Object.Destroy(FallbackCube);
+        if (DifSky.Moon != null) UnityEngine.Object.Destroy(DifSky.Moon);
+
+        GlowCube = null;
+        StarCube = null;
+        BaseCube = null;
+        FallbackCube = null;
+        DifSkyLayers.Ready = false;
+    }
+}
+
+internal static class DifSkyLayers
+{
+    private const float GlowIntensity = 0.45f;
+    private const float StarIntensity = 0.45f;
+
+    public static bool Ready;
+    public static bool Active { get; private set; }
+    public static Material GlowMaterial { get; private set; }
+    public static Material StarMaterial { get; private set; }
+
+    private static Shader cachedShader;
+    private static AssetBundle skyBundle;
+
+    public static Shader FindShader()
+    {
+        if (cachedShader != null) return cachedShader;
+
+        string bundlePath = Path.Combine(DifSkyAssets.Root, "difrustsky");
+        if (!File.Exists(bundlePath))
+        {
+            Debug.LogWarning("[DifRUST][sky] sky bundle missing: " + bundlePath);
+            return null;
+        }
+
+        try
+        {
+            skyBundle = AssetBundle.LoadFromFile(bundlePath);
+            if (skyBundle == null)
+            {
+                Debug.LogWarning("[DifRUST][sky] sky bundle failed to load");
+                return null;
+            }
+
+            Shader[] shaders = skyBundle.LoadAllAssets<Shader>();
+            if (shaders == null || shaders.Length == 0)
+            {
+                Debug.LogWarning("[DifRUST][sky] sky bundle has no shaders");
+                return null;
+            }
+
+            cachedShader = shaders[0];
+            Debug.Log("[DifRUST][sky] layer shader: " + cachedShader.name);
+            return cachedShader;
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning("[DifRUST][sky] sky bundle error: " + e.Message);
+            return null;
+        }
+    }
+
+    public static void CreateMaterials()
+    {
+        if (Active) return;
+        if (DifSkyAssets.GlowCube == null || DifSkyAssets.StarCube == null)
+            return;
+
+        Shader sh = FindShader();
+        if (sh == null)
+        {
+            Ready = false;
+            return;
+        }
+
+        try
+        {
+            GlowMaterial = MakeMaterial(sh, DifSkyAssets.GlowCube);
+            StarMaterial = MakeMaterial(sh, DifSkyAssets.StarCube);
+            Active = true;
+            Debug.Log("[DifRUST][sky] layer materials ready: " + sh.name);
+        }
+        catch (Exception e)
+        {
+            Debug.LogError("[DifRUST][sky] layer materials failed: " + e);
+            Restore();
+            Ready = false;
+        }
+    }
+
+    private static Material MakeMaterial(Shader sh, Cubemap cube)
+    {
+        Material m = new Material(sh);
+        m.hideFlags = HideFlags.HideAndDontSave;
+        m.SetTexture("_MainTex", cube);
+        if (m.HasProperty("_TintColor"))
+            m.SetColor("_TintColor", new Color(0.5f, 0.5f, 0.5f, 0.5f));
+        m.renderQueue = 1000;
+        return m;
+    }
+
+    public static void Tick()
+    {
+        if (!Active) return;
+
+        float night = Mathf.Clamp01(
+            (RustLighting.NightDepth() - 0.35f) / 0.65f);
+        float weather = Mathf.Clamp01(SkyManager.starIntensity);
+        float amount = Mathf.Clamp(RustSettings.SkyAmount, 0.3f, 1.5f);
+        float k = RustSettings.SkyOn ? night * weather * amount : 0f;
+
+        // Fragment = 2 * _TintColor * cube; RGB задаёт яркость,
+        // alpha 0.5 нужна для Blend SrcAlpha One.
+        float g = 0.5f * GlowIntensity * k;
+        float s = 0.5f * StarIntensity * k;
+
+        if (GlowMaterial != null)
+            GlowMaterial.SetColor("_TintColor", new Color(g, g, g, 0.5f));
+        if (StarMaterial != null)
+            StarMaterial.SetColor("_TintColor", new Color(s, s, s, 0.5f));
+    }
+
+    public static void Restore()
+    {
+        if (GlowMaterial != null) UnityEngine.Object.Destroy(GlowMaterial);
+        if (StarMaterial != null) UnityEngine.Object.Destroy(StarMaterial);
+        GlowMaterial = null;
+        StarMaterial = null;
+        Active = false;
+    }
+}
+
+// Плотная сфера неба: ванильная сетка низкополигональная, и в прицеле
+// кубмапа растягивается по крупным треугольникам.
+internal static class DifSkyMesh
+{
+    private static Mesh plainMesh;
+    private static Mesh layeredMesh;
+    private static MeshFilter filter;
+    private static Renderer renderer;
+    private static Mesh original;
+    private static Material[] originalMats;
+    private static bool applied;
+    private static bool yielded;
+
+    public static void Tick()
+    {
+        Transform t = SkyManager.atmosphereSphere;
+        if (t == null) return;
+
+        MeshFilter mf = t.GetComponent<MeshFilter>();
+        if (mf == null) return;
+
+        if (!ReferenceEquals(mf, filter))
+        {
+            filter = mf;
+            original = mf.sharedMesh;
+            renderer = t.GetComponent<Renderer>();
+            originalMats = renderer != null ? renderer.sharedMaterials : null;
+            applied = false;
+            yielded = false;
+        }
+
+        if (!RustSettings.SkyOn || !RustSettings.SkyMesh)
+        {
+            Restore();
+            return;
+        }
+
+        if (yielded) return;
+
+        Mesh cur = mf.sharedMesh;
+        if (cur != null && cur != plainMesh && cur != layeredMesh && cur != original)
+        {
+            yielded = true;
+            Debug.Log("[DifRUST][sky] atmosphere mesh changed by another mod, yielding");
+            return;
+        }
+
+        if (original != null && original.vertexCount > 8000)
+            return;
+
+        if (DifSkyLayers.Active && !DifSky.SkyYielded
+            && !ReferenceEquals(DifSky.Cube, DifSkyAssets.BaseCube))
+            DifSky.UseLayeredSky();
+
+        bool layers = DifSkyLayers.Active && DifSky.SkyActive;
+
+        if (layers)
+        {
+            if (layeredMesh == null) layeredMesh = Build(128, 64, 3);
+            if (mf.sharedMesh != layeredMesh) mf.sharedMesh = layeredMesh;
+
+            Material atmo = SkyManager.atmosphereMtrl;
+            if (atmo == null && originalMats != null && originalMats.Length > 0)
+                atmo = originalMats[0];
+
+            if (renderer != null && atmo != null
+                && DifSkyLayers.GlowMaterial != null
+                && DifSkyLayers.StarMaterial != null)
+            {
+                renderer.sharedMaterials = new Material[]
+                {
+                    atmo,
+                    DifSkyLayers.GlowMaterial,
+                    DifSkyLayers.StarMaterial
+                };
+            }
+
+            applied = true;
+        }
+        else
+        {
+            if (plainMesh == null) plainMesh = Build(128, 64, 1);
+            if (mf.sharedMesh != plainMesh) mf.sharedMesh = plainMesh;
+
+            if (renderer != null)
+            {
+                Material atmo = SkyManager.atmosphereMtrl;
+                if (atmo != null) renderer.sharedMaterial = atmo;
+                else if (originalMats != null) renderer.sharedMaterials = originalMats;
+            }
+
+            applied = true;
+        }
+    }
+
+    public static void Restore()
+    {
+        try
+        {
+            if (filter != null && original != null && applied)
+                filter.sharedMesh = original;
+            if (renderer != null && originalMats != null && applied)
+                renderer.sharedMaterials = originalMats;
+        }
+        catch
+        {
+        }
+
+        applied = false;
+    }
+
+    private static Mesh Build(int lon, int lat, int submeshes)
+    {
+        var verts = new List<Vector3>();
+        var uvs = new List<Vector2>();
+        var front = new List<int>();
+        var back = new List<int>();
+
+        for (int y = 0; y <= lat; y++)
+        {
+            float v = (float)y / lat;
+            float theta = v * Mathf.PI;
+
+            for (int x = 0; x <= lon; x++)
+            {
+                float u = (float)x / lon;
+                float phi = u * Mathf.PI * 2f;
+
+                verts.Add(new Vector3(
+                    Mathf.Sin(theta) * Mathf.Cos(phi),
+                    Mathf.Cos(theta),
+                    Mathf.Sin(theta) * Mathf.Sin(phi)));
+                uvs.Add(new Vector2(u, 1f - v));
+            }
+        }
+
+        for (int y = 0; y < lat; y++)
+        {
+            for (int x = 0; x < lon; x++)
+            {
+                int a = y * (lon + 1) + x;
+                int b = a + 1;
+                int c = a + lon + 1;
+                int d = c + 1;
+
+                front.Add(a); front.Add(c); front.Add(b);
+                front.Add(b); front.Add(c); front.Add(d);
+
+                back.Add(a); back.Add(b); back.Add(c);
+                back.Add(b); back.Add(d); back.Add(c);
+            }
+        }
+
+        Mesh mesh = new Mesh();
+        mesh.SetVertices(verts);
+        mesh.SetUVs(0, uvs);
+        mesh.subMeshCount = submeshes;
+
+        var atmoTris = new List<int>(front);
+        atmoTris.AddRange(back);
+        mesh.SetTriangles(atmoTris, 0);
+
+        // Слои не нуждаются в двух сторонах: шейдер слоёв Cull Off,
+        // а двойной набор удвоил бы яркость.
+        for (int s = 1; s < submeshes; s++)
+            mesh.SetTriangles(front, s);
+
+        mesh.RecalculateNormals();
+        mesh.RecalculateBounds();
+        mesh.hideFlags = HideFlags.HideAndDontSave;
+        return mesh;
+    }
+}
+
+public class DifSkyBehaviour : MonoBehaviour
+{
+    private void Start()
+    {
+        StartCoroutine(DifSkyAssets.LoadAll());
+    }
+
+    private void LateUpdate()
+    {
+        DifSky.Tick();
+    }
+
+    private void OnDestroy()
+    {
+        DifSky.Restore();
+    }
+}
+
+// Диагностика ночного неба — шаг 1 плана `SKY-PLAN.md`.
+// Только чтение: материалы, шейдеры, текстуры, направления солнца/луны,
+// камера. Визуально мод не меняется.
+// Пишет `DifRUST-sky.log` в persistentDataPath и одну строку в лог игры.
+// Срез снимается при входе в мир, в 00:00 и 12:00 игрового времени,
+// а также вручную по NumPad9 (чтобы поймать любой ракурс луны).
+internal static class DifSkyDiag
+{
+    public const string Version = "1.7.0";
+
+    private static string filePath;
+    private static bool fileReady;
+
+    public static void Create()
+    {
+        try
+        {
+            GameObject go = new GameObject("DifRUSTSkyDiag");
+            UnityEngine.Object.DontDestroyOnLoad(go);
+            go.hideFlags = HideFlags.HideAndDontSave;
+            go.AddComponent<DifSkyDiagBehaviour>();
+        }
+        catch (Exception e)
+        {
+            Debug.LogError("[DifRUST][sky] diag create failed: " + e);
+        }
+    }
+
+    private static string FilePath
+    {
+        get
+        {
+            if (filePath == null)
+            {
+                try
+                {
+                    filePath = Path.Combine(Application.persistentDataPath,
+                        "DifRUST-sky.log");
+                }
+                catch
+                {
+                    filePath = "DifRUST-sky.log";
+                }
+            }
+            return filePath;
+        }
+    }
+
+    // true — срез записан, можно отмечать слот как снятый.
+    public static bool Dump(string tag)
+    {
+        SkyManager sm = SkyManager.skyManager;
+        if (sm == null || SkyManager.moonSpriteMat == null
+            || SkyManager.moonSpriteT == null)
+            return false;
+
+        World world = GameManager.Instance != null ? GameManager.Instance.World : null;
+        ulong wt = world != null ? world.GetWorldTime() : 0UL;
+        int day = world != null ? GameUtils.WorldTimeToDays(wt) : -1;
+        int hour = world != null ? GameUtils.WorldTimeToHours(wt) : -1;
+        int minute = world != null ? GameUtils.WorldTimeToMinutes(wt) : -1;
+
+        StringBuilder sb = new StringBuilder(24 * 1024);
+        sb.AppendLine();
+        sb.AppendLine("################ " + tag + " ################");
+        sb.AppendLine("real: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
+            + "  uptime=" + Fmt(Time.realtimeSinceStartup) + "s  frame=" + Time.frameCount);
+        sb.AppendLine("time: day " + day + "  "
+            + hour.ToString("00") + ":" + minute.ToString("00")
+            + "  raw=" + wt
+            + "  clock=" + Fmt(RustLighting.GetClock())
+            + "  nightDepth=" + Fmt(RustLighting.NightDepth())
+            + "  factor=" + Fmt(RustLighting.GetFactor())
+            + "  dayLength=" + DayLength() + " min");
+
+        sb.AppendLine();
+        sb.AppendLine("--- directions");
+        Vector3 moonDir = SkyManager.GetMoonDirection();
+        Vector3 sunDir = SkyManager.GetSunDirection();
+        sb.AppendLine("  moonDir=" + Vec(moonDir) + "  len=" + Fmt(moonDir.magnitude)
+            + "  altitude=" + Fmt(moonDir.y));
+        sb.AppendLine("  sunDir=" + Vec(sunDir) + "  altitude=" + Fmt(sunDir.y));
+        sb.AppendLine("  sunMoonDirV=" + Vec(SkyManager.sunMoonDirV));
+        sb.AppendLine("  moonBright=" + Fmt(SkyManager.moonBright)
+            + "  GetMoonBrightness=" + Fmt(SkyManager.GetMoonBrightness())
+            + "  moonLightColor=" + Col(SkyManager.GetMoonLightColor()));
+        if (SkyManager.moonLight != null)
+        {
+            sb.AppendLine("  moonLight: intensity="
+                + Fmt(SkyManager.moonLight.intensity)
+                + "  color=" + Col(SkyManager.moonLight.color)
+                + "  rot=" + Quat(SkyManager.moonLight.transform.rotation));
+        }
+        if (SkyManager.sMoonPhases != null)
+            sb.AppendLine("  sMoonPhases[" + SkyManager.sMoonPhases.Length + "]="
+                + Floats(SkyManager.sMoonPhases));
+        if (SkyManager.sMoonBrights != null)
+            sb.AppendLine("  sMoonBrights[" + SkyManager.sMoonBrights.Length + "]="
+                + Floats(SkyManager.sMoonBrights));
+
+        sb.AppendLine();
+        sb.AppendLine("--- camera");
+        Camera cam = Camera.main;
+        if (cam == null)
+        {
+            sb.AppendLine("  <null>");
+        }
+        else
+        {
+            sb.AppendLine("  " + cam.name + "  instance=" + cam.GetInstanceID());
+            sb.AppendLine("  near=" + Fmt(cam.nearClipPlane)
+                + "  far=" + Fmt(cam.farClipPlane)
+                + "  fov=" + Fmt(cam.fieldOfView)
+                + "  aspect=" + Fmt(cam.aspect));
+            sb.AppendLine("  clearFlags=" + cam.clearFlags
+                + "  depthTextureMode=" + cam.depthTextureMode
+                + "  renderingPath=" + cam.actualRenderingPath
+                + "  hdr=" + cam.allowHDR + "  msaa=" + cam.allowMSAA
+                + "  " + cam.pixelWidth + "x" + cam.pixelHeight);
+            sb.AppendLine("  pos=" + Vec(cam.transform.position)
+                + "  forward=" + Vec(cam.transform.forward));
+        }
+
+        sb.AppendLine();
+        sb.AppendLine("--- render settings");
+        Material skybox = RenderSettings.skybox;
+        sb.AppendLine("  skybox=" + (skybox != null
+            ? skybox.name + " / " + ShaderName(skybox)
+            : "<null>")
+            + "  instance=" + (skybox != null ? skybox.GetInstanceID() : 0));
+        sb.AppendLine("  ambientMode=" + RenderSettings.ambientMode
+            + "  fog=" + RenderSettings.fog
+            + "  fogDensity=" + Fmt(RenderSettings.fogDensity)
+            + "  fogColor=" + Col(RenderSettings.fogColor));
+
+        sb.AppendLine();
+        sb.AppendLine("--- all cameras");
+        Camera[] cams = Camera.allCameras;
+        sb.AppendLine("  count=" + Camera.allCamerasCount);
+        for (int i = 0; i < cams.Length; i++)
+        {
+            Camera c = cams[i];
+            if (c == null) continue;
+            sb.AppendLine("  [" + i + "] " + c.name
+                + "  tag=" + c.tag
+                + "  enabled=" + c.enabled
+                + "  depth=" + Fmt(c.depth)
+                + "  near=" + Fmt(c.nearClipPlane)
+                + "  far=" + Fmt(c.farClipPlane)
+                + "  fov=" + Fmt(c.fieldOfView)
+                + "  clear=" + c.clearFlags
+                + "  cullingMask=0x" + c.cullingMask.ToString("X8")
+                + "  target=" + (c.targetTexture != null ? c.targetTexture.name : "<screen>")
+                + "  rect=" + c.rect
+                + "  depthTex=" + c.depthTextureMode);
+            sb.AppendLine("      layers: " + LayerNames(c.cullingMask));
+            sb.AppendLine("      pos=" + Vec(c.transform.position));
+        }
+
+        sb.AppendLine();
+        sb.AppendLine("--- quality / graphics");
+        sb.AppendLine("  colorSpace=" + QualitySettings.activeColorSpace
+            + "  api=" + SystemInfo.graphicsDeviceType
+            + "  gpu=" + SystemInfo.graphicsDeviceName);
+        Material atmoM = SkyManager.atmosphereMtrl;
+        Cubemap vanillaCube = atmoM != null
+            ? atmoM.GetTexture("_OuterSpaceCube") as Cubemap : null;
+        sb.AppendLine("  vanillaCube=" + CubeInfo(vanillaCube));
+        sb.AppendLine("  atmosphereEuler=" + (SkyManager.atmosphereSphere != null
+                ? Vec(SkyManager.atmosphereSphere.eulerAngles) : "<null>")
+            + "  cloudsEuler=" + (SkyManager.cloudsSphere != null
+                ? Vec(SkyManager.cloudsSphere.eulerAngles) : "<null>"));
+        if (cam != null)
+        {
+            Component[] comps = cam.GetComponents<Component>();
+            StringBuilder names = new StringBuilder();
+            for (int i = 0; i < comps.Length; i++)
+            {
+                if (comps[i] == null) continue;
+                if (names.Length > 0) names.Append(", ");
+                names.Append(comps[i].GetType().Name);
+            }
+            sb.AppendLine("  cameraComponents=" + names);
+        }
+
+        sb.AppendLine();
+        sb.AppendLine("=== SKY SYSTEM");
+        Transform root = SkyManager.parent != null
+            ? SkyManager.parent.transform : null;
+        DumpTransform(sb, "  ", root);
+        if (root != null)
+        {
+            sb.AppendLine("  hierarchy:");
+            DumpHierarchy(sb, root, 2, 3);
+        }
+        sb.AppendLine("  starIntensity=" + Fmt(SkyManager.starIntensity)
+            + "  SkyColor=" + Col(SkyManager.SkyColor)
+            + "  fogColor=" + Col(SkyManager.fogColor)
+            + "  dayPercent=" + Fmt(SkyManager.dayPercent)
+            + "  worldRotation=" + Fmt(SkyManager.worldRotation)
+            + "  cloudTransition=" + Fmt(SkyManager.cloudTransition));
+        sb.AppendLine("  cloudMainTex=" + TexInfo(SkyManager.cloudMainTex)
+            + "  cloudBlendTex=" + TexInfo(SkyManager.cloudBlendTex));
+        sb.AppendLine("  atmosphereMesh=" + MeshInfo(SkyManager.atmosphereSphere)
+            + "  cloudsMesh=" + MeshInfo(SkyManager.cloudsSphere));
+        sb.AppendLine("  atmosphereSphere=" + (SkyManager.atmosphereSphere != null
+            ? SkyManager.atmosphereSphere.name + "  instance="
+                + SkyManager.atmosphereSphere.GetInstanceID()
+            : "<null>"));
+        sb.AppendLine("  cloudsSphere=" + (SkyManager.cloudsSphere != null
+            ? SkyManager.cloudsSphere.name + "  instance="
+                + SkyManager.cloudsSphere.GetInstanceID()
+            : "<null>"));
+        sb.AppendLine("  mainCamera=" + (SkyManager.mainCamera != null
+            ? SkyManager.mainCamera.name + "  far="
+                + Fmt(SkyManager.mainCamera.farClipPlane)
+            : "<null>"));
+
+        DumpMaterial(sb, "SkyManager.atmosphereMtrl", SkyManager.atmosphereMtrl);
+        DumpMaterial(sb, "SkyManager.cloudsSphereMtrl", SkyManager.cloudsSphereMtrl);
+
+        sb.AppendLine();
+        sb.AppendLine("=== MOON SPRITE DIRECT");
+        DumpTransform(sb, "  ", SkyManager.moonSpriteT);
+        DumpRenderer(sb, "  ", SkyManager.moonSpriteT);
+        DumpMesh(sb, "  ", SkyManager.moonSpriteT);
+        sb.AppendLine("  layer=" + LayerOf(SkyManager.moonSpriteT));
+        DumpMaterial(sb, "SkyManager.moonSpriteMat", SkyManager.moonSpriteMat);
+
+        sb.AppendLine();
+        sb.AppendLine("=== END " + tag);
+
+        string text = sb.ToString();
+        if (!Write(text))
+        {
+            Debug.Log(text);
+        }
+        Debug.Log("[DifRUST][sky] dump " + tag + " -> " + FilePath
+            + "  (day " + day + " " + hour.ToString("00") + ":" + minute.ToString("00") + ")");
+        return true;
+    }
+
+    private static bool Write(string text)
+    {
+        try
+        {
+            if (!fileReady)
+            {
+                string dir = Path.GetDirectoryName(FilePath);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                    Directory.CreateDirectory(dir);
+
+                StringBuilder head = new StringBuilder();
+                head.AppendLine("=== DifRUST sky diagnostics " + Version + " ===");
+                head.AppendLine("session: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+                head.AppendLine("unity: " + Application.unityVersion
+                    + "  game: " + Application.version
+                    + "  platform: " + Application.platform);
+                head.AppendLine();
+
+                File.WriteAllText(FilePath, head.ToString());
+                fileReady = true;
+            }
+
+            File.AppendAllText(FilePath, text);
+            return true;
+        }
+        catch (Exception e)
+        {
+            Debug.LogError("[DifRUST][sky] log write failed: " + e);
+            return false;
+        }
+    }
+
+    // Строка пробы: в тот же файл и в лог игры.
+    public static void LogLine(string line)
+    {
+        float clock = RustLighting.GetClock();
+        string text = "probe " + (clock < 0f ? "--:--" : clock.ToString("0.00"))
+            + "  " + line + Environment.NewLine;
+
+        if (!Write(text))
+            Debug.Log("[DifRUST][sky] " + line.Trim());
+        else
+            Debug.Log("[DifRUST][sky] probe: " + line);
+    }
+
+    private static void DumpMesh(StringBuilder sb, string pad, Transform t)
+    {
+        if (t == null) return;
+
+        MeshFilter mf = t.GetComponent<MeshFilter>();
+        if (mf == null || mf.sharedMesh == null)
+        {
+            sb.AppendLine(pad + "mesh: <none>");
+            return;
+        }
+
+        Mesh mesh = mf.sharedMesh;
+        sb.AppendLine(pad + "mesh=" + mesh.name
+            + "  verts=" + mesh.vertexCount
+            + "  subMeshes=" + mesh.subMeshCount
+            + "  bounds=" + Vec(mesh.bounds.size));
+    }
+
+    private static string LayerOf(Transform t)
+    {
+        if (t == null) return "<null>";
+
+        int layer = t.gameObject.layer;
+        string name = LayerMask.LayerToName(layer);
+        return layer + (string.IsNullOrEmpty(name) ? "" : " (" + name + ")");
+    }
+
+    private static string LayerNames(int mask)
+    {
+        StringBuilder s = new StringBuilder();
+
+        for (int i = 0; i < 32; i++)
+        {
+            if ((mask & (1 << i)) == 0) continue;
+
+            string name = LayerMask.LayerToName(i);
+            if (s.Length > 0) s.Append(", ");
+            s.Append(i).Append(string.IsNullOrEmpty(name) ? "" : ":" + name);
+        }
+
+        return s.Length > 0 ? s.ToString() : "<none>";
+    }
+
+    private static void DumpHierarchy(StringBuilder sb, Transform t, int depth, int maxDepth)
+    {
+        if (t == null || depth > maxDepth + 1) return;
+
+        string pad = new string(' ', depth * 2);
+        sb.AppendLine(pad + "- " + t.name
+            + "  active=" + t.gameObject.activeSelf
+            + "  layer=" + t.gameObject.layer
+            + "  localPos=" + Vec(t.localPosition)
+            + "  localScale=" + Vec(t.localScale));
+
+        Renderer r = t.GetComponent<Renderer>();
+        if (r != null)
+        {
+            sb.AppendLine(pad + "    renderer=" + r.GetType().Name
+                + "  enabled=" + r.enabled
+                + "  mat=" + (r.sharedMaterial != null
+                    ? r.sharedMaterial.name + " / " + ShaderName(r.sharedMaterial)
+                    : "<null>"));
+        }
+
+        for (int i = 0; i < t.childCount; i++)
+            DumpHierarchy(sb, t.GetChild(i), depth + 1, maxDepth);
+    }
+
+    private static void DumpTransform(StringBuilder sb, string pad, Transform t)
+    {
+        if (t == null)
+        {
+            sb.AppendLine(pad + "transform: <null>");
+            return;
+        }
+
+        sb.AppendLine(pad + "transform: " + t.name
+            + "  instance=" + t.GetInstanceID());
+        sb.AppendLine(pad + "  worldPos=" + Vec(t.position)
+            + "  localPos=" + Vec(t.localPosition));
+        sb.AppendLine(pad + "  worldScale=" + Vec(t.lossyScale)
+            + "  localScale=" + Vec(t.localScale));
+        sb.AppendLine(pad + "  euler=" + Vec(t.eulerAngles)
+            + "  forward=" + Vec(t.forward));
+        sb.AppendLine(pad + "  parent=" + (t.parent != null ? t.parent.name : "<none>")
+            + "  children=" + t.childCount
+            + "  activeInHierarchy=" + t.gameObject.activeInHierarchy);
+    }
+
+    private static void DumpRenderer(StringBuilder sb, string pad, Transform t)
+    {
+        if (t == null) return;
+
+        Renderer r = t.GetComponent<Renderer>();
+        if (r == null)
+        {
+            sb.AppendLine(pad + "renderer: <none>");
+            return;
+        }
+
+        sb.AppendLine(pad + "renderer: " + r.GetType().Name
+            + "  enabled=" + r.enabled
+            + "  castShadows=" + r.shadowCastingMode
+            + "  receiveShadows=" + r.receiveShadows);
+        sb.AppendLine(pad + "  sharedMaterial=" + (r.sharedMaterial != null
+            ? r.sharedMaterial.name + " / " + ShaderName(r.sharedMaterial)
+            : "<null>"));
+
+        Bounds b = r.bounds;
+        sb.AppendLine(pad + "  boundsCenter=" + Vec(b.center)
+            + "  boundsSize=" + Vec(b.size));
+    }
+
+    private static void DumpMaterial(StringBuilder sb, string label, Material m)
+    {
+        sb.AppendLine("--- material: " + label);
+        if (m == null)
+        {
+            sb.AppendLine("  <null>");
+            return;
+        }
+
+        Shader sh = m.shader;
+        sb.AppendLine("  name=" + m.name + "  instance=" + m.GetInstanceID()
+            + "  renderQueue=" + m.renderQueue
+            + "  passes=" + m.passCount);
+        sb.AppendLine("  shader=" + (sh != null ? sh.name : "<null>")
+            + (sh != null
+                ? "  queue=" + sh.renderQueue + "  supported=" + sh.isSupported
+                : ""));
+
+        string[] kw = m.shaderKeywords;
+        if (kw != null && kw.Length > 0)
+            sb.AppendLine("  keywords=" + string.Join(", ", kw));
+
+        if (sh == null) return;
+
+        int count = 0;
+        try
+        {
+            count = sh.GetPropertyCount();
+        }
+        catch (Exception e)
+        {
+            sb.AppendLine("  GetPropertyCount failed: " + e.Message);
+        }
+
+        if (count == 0)
+        {
+            sb.AppendLine("  exposed properties: 0");
+            return;
+        }
+
+        sb.AppendLine("  properties (" + count + "):");
+
+        for (int i = 0; i < count; i++)
+        {
+            string p;
+            try
+            {
+                p = sh.GetPropertyName(i);
+            }
+            catch
+            {
+                continue;
+            }
+
+            try
+            {
+                if (m.HasTexture(p))
+                {
+                    sb.AppendLine("    " + p + " = tex " + TexInfo(m.GetTexture(p)));
+                }
+                else if (m.HasColor(p))
+                {
+                    sb.AppendLine("    " + p + " = " + Col(m.GetColor(p)));
+                }
+                else if (m.HasVector(p))
+                {
+                    sb.AppendLine("    " + p + " = " + Vec4(m.GetVector(p)));
+                }
+                else if (m.HasFloat(p))
+                {
+                    sb.AppendLine("    " + p + " = " + Fmt(m.GetFloat(p)));
+                }
+                else
+                {
+                    sb.AppendLine("    " + p + " = <unset>");
+                }
+            }
+            catch (Exception e)
+            {
+                sb.AppendLine("    " + p + " = <read failed: " + e.Message + ">");
+            }
+        }
+    }
+
+    private static string TexInfo(Texture t)
+    {
+        if (t == null) return "<null>";
+
+        StringBuilder s = new StringBuilder();
+        s.Append(t.name).Append(" [").Append(t.GetType().Name).Append("] ");
+        s.Append(t.width).Append("x").Append(t.height);
+
+        Texture2D t2 = t as Texture2D;
+        if (t2 != null)
+        {
+            s.Append(" fmt=").Append(t2.format);
+            s.Append(" mips=").Append(t2.mipmapCount);
+        }
+
+        s.Append(" wrap=").Append(t.wrapMode);
+        s.Append(" filter=").Append(t.filterMode);
+        s.Append(" aniso=").Append(t.anisoLevel);
+        return s.ToString();
+    }
+
+    private static string ShaderName(Material m)
+    {
+        if (m == null || m.shader == null) return "<null>";
+        return m.shader.name;
+    }
+
+    private static string CubeInfo(Cubemap c)
+    {
+        if (c == null) return "<null>";
+
+        return c.name + "  " + c.width + "x" + c.height
+            + "  fmt=" + c.format
+            + "  mips=" + c.mipmapCount
+            + "  readable=" + c.isReadable
+            + "  filter=" + c.filterMode
+            + "  wrap=" + c.wrapMode
+            + "  aniso=" + c.anisoLevel
+            + "  dim=" + c.dimension;
+    }
+
+    private static string MeshInfo(Transform t)
+    {
+        if (t == null) return "<null>";
+
+        MeshFilter mf = t.GetComponent<MeshFilter>();
+        if (mf == null || mf.sharedMesh == null) return "<none>";
+
+        Mesh m = mf.sharedMesh;
+        return m.name + "  verts=" + m.vertexCount
+            + "  tris=" + (m.triangles.Length / 3);
+    }
+
+    private static string DayLength()
+    {
+        try
+        {
+            return GamePrefs.GetInt(EnumGamePrefs.DayNightLength).ToString();
+        }
+        catch
+        {
+            return "?";
+        }
+    }
+
+    private static string Fmt(float v)
+    {
+        if (float.IsNaN(v)) return "NaN";
+        if (float.IsPositiveInfinity(v)) return "+inf";
+        if (float.IsNegativeInfinity(v)) return "-inf";
+        return v.ToString("0.####",
+            System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    private static string Vec(Vector3 v)
+    {
+        return "(" + Fmt(v.x) + ", " + Fmt(v.y) + ", " + Fmt(v.z) + ")";
+    }
+
+    private static string Vec4(Vector4 v)
+    {
+        return "(" + Fmt(v.x) + ", " + Fmt(v.y) + ", "
+            + Fmt(v.z) + ", " + Fmt(v.w) + ")";
+    }
+
+    private static string Col(Color c)
+    {
+        return "(" + Fmt(c.r) + ", " + Fmt(c.g) + ", "
+            + Fmt(c.b) + ", " + Fmt(c.a) + ")";
+    }
+
+    private static string Quat(Quaternion q)
+    {
+        return "euler" + Vec(q.eulerAngles);
+    }
+
+    private static string Floats(float[] a)
+    {
+        if (a == null) return "<null>";
+
+        StringBuilder s = new StringBuilder();
+        for (int i = 0; i < a.Length; i++)
+        {
+            if (i > 0) s.Append(", ");
+            s.Append(Fmt(a[i]));
+        }
+        return s.ToString();
+    }
+}
+
+public class DifSkyDiagBehaviour : MonoBehaviour
+{
+    private bool startupDone;
+    private int lastDay = -1;
+    private int lastSlot = -1;
+    private float nextTry;
+
+    private void Update()
+    {
+        if (Input.GetKeyDown(KeyCode.Keypad9))
+        {
+            if (!DifSkyDiag.Dump("manual"))
+                Debug.LogWarning("[DifRUST][sky] manual dump skipped: sky not ready");
+        }
+
+        if (Time.time < nextTry) return;
+        nextTry = Time.time + 1f;
+
+        GameManager gm = GameManager.Instance;
+        World world = gm != null ? gm.World : null;
+        if (world == null) return;
+
+        ulong wt = world.GetWorldTime();
+        int day = GameUtils.WorldTimeToDays(wt);
+        int hour = GameUtils.WorldTimeToHours(wt);
+
+        if (!startupDone)
+        {
+            // Ждём игрока: срез на экране загрузки бесполезен.
+            if (world.GetPrimaryPlayer() == null) return;
+
+            startupDone = DifSkyDiag.Dump("startup");
+
+            // Если вошли ровно в полдень/полночь, не дублируем срез.
+            if (startupDone && (hour == 0 || hour == 12))
+            {
+                lastDay = day;
+                lastSlot = hour;
+            }
+            return;
+        }
+
+        if (hour != 0 && hour != 12) return;
+        if (day == lastDay && hour == lastSlot) return;
+
+        if (DifSkyDiag.Dump(hour == 0 ? "midnight" : "noon"))
+        {
+            lastDay = day;
+            lastSlot = hour;
+        }
+    }
+}
+
 public class DifMenuBehaviour : MonoBehaviour
 {
     public static bool IsOpen { get; private set; }
@@ -1668,7 +3326,7 @@ public class DifMenuBehaviour : MonoBehaviour
     }
 
     private bool open;
-    private Rect windowRect = new Rect(70f, 40f, 470f, 682f);
+    private Rect windowRect = new Rect(70f, 40f, 470f, 825f);
 
     private Texture2D panelTex;
     private Texture2D accentTex;
@@ -1851,6 +3509,73 @@ public class DifMenuBehaviour : MonoBehaviour
         GUI.enabled = true;
 
         y += 26f;
+
+        // Ночное небо 1.6.0: косметика клиента, без хоста и без замка.
+        GUI.Label(new Rect(18f, y, w - 36f, 20f),
+            RustText.T("NIGHT SKY", "НОЧНОЕ НЕБО"), labelStyle);
+        y += 22f;
+
+        ToggleAt(18f, y, colW, ref RustSettings.SkyOn,
+            RustText.T("  Milky Way", "  Млечный Путь"));
+
+        ToggleAt(18f + colW + 8f, y, colW, ref RustSettings.SkyMoon,
+            RustText.T("  Second moon", "  Вторая луна"));
+        y += 24f;
+
+        GUI.Label(new Rect(18f, y, w - 130f, 20f),
+            RustText.T("Sky brightness", "Яркость неба"), labelStyle);
+        GUI.Label(new Rect(w - 110f, y, 92f, 20f),
+            Mathf.RoundToInt(RustSettings.SkyAmount * 100f) + "%", valueStyle);
+
+        float skyAmount = RustSettings.SkyAmount;
+        float newSkyAmount = GUI.HorizontalSlider(
+            new Rect(18f, y + 22f, w - 36f, 18f),
+            skyAmount, 0.3f, 1.5f);
+
+        if (Mathf.Abs(newSkyAmount - skyAmount) > 0.001f)
+        {
+            RustSettings.SkyAmount = Mathf.Clamp(newSkyAmount, 0.3f, 1.5f);
+            RustSettings.MarkDirty();
+            RustSettings.Save();
+        }
+
+        y += 46f;
+
+        if (RustSettings.SkyMoon)
+        {
+            string moonHint;
+
+            if (DifSky.SecondMoonActive)
+            {
+                moonHint = string.Format(RustText.T(
+                    "Tonight: {0}. The second moon burns brighter.",
+                    "Сегодня: {0}. Вторая луна разгорается ярче."),
+                    DifSky.SpecialMoonName());
+            }
+            else if (DifSky.LunarApiAvailable)
+            {
+                moonHint = RustText.T(
+                    "Ordinary night: the second moon is calm and dimmer.",
+                    "Обычная ночь: вторая луна спокойная и тусклее.");
+            }
+            else
+            {
+                moonHint = RustText.T(
+                    "LunarEvents is not installed: the second moon stays calm.",
+                    "LunarEvents не установлен: вторая луна остаётся спокойной.");
+            }
+
+            GUI.Label(new Rect(18f, y, w - 36f, 20f), moonHint, hintStyle);
+            y += 20f;
+        }
+        else
+        {
+            GUI.Label(new Rect(18f, y, w - 36f, 20f),
+                RustText.T("Every night; brighter on special LunarEvents nights.",
+                           "Каждую ночь; ярче в особые ночи LunarEvents."),
+                hintStyle);
+            y += 20f;
+        }
 
         string conflict = RustConflicts.Name;
         if (!string.IsNullOrEmpty(conflict))

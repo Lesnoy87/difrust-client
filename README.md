@@ -1,4 +1,4 @@
-# DifRUST — Rust Nights 1.5.4
+# DifRUST — Rust Nights 1.7.0
 
 Client-side lighting mod for 7 Days to Die 3.4.x. Only lighting is changed: fog,
 weather, zombies, loot, progression and network logic are untouched.
@@ -11,6 +11,28 @@ weather, zombies, loot, progression and network logic are untouched.
 | 22:00–04:00 | full darkness |
 | 04:00–06:00 | gradual dawn |
 | 06:00–20:00 | normal lighting |
+
+## What's new in 1.7.0
+
+- **Second moon, vanilla moon stays.** The custom gold moon no longer replaces
+  the vanilla one. A smaller companion (58 %) follows its own nearby orbit —
+  about 29° higher and 20° to the side — and is visible **every night** when
+  the toggle is on. On an ordinary night it is calm and slightly cooler; on a
+  special LunarEvents night it burns brighter and takes the event's tint
+  (harvest gold, wild amber, fatal red, …). It is always a full gold disc, not
+  the current vanilla phase. Works with or without LunarEvents; on by default.
+- **Rebuilt star field.** 223 000 stars on 2048² faces instead of 42 000 on
+  1024²: realistic magnitude distribution (many faint, a few bright),
+  blue-white to orange colours, concentration toward the galactic plane, and
+  dust lanes that thin out the stars. A scope shows crisp pinpoints.
+- **Layered bake.** The deep-space base, the Milky Way glow and the stars are
+  generated as separate content and baked into the 2048² cubemap. A runtime
+  three-submesh version was tested but disabled: the game's sky compositor
+  (`ZTest Always` plus a separate sky pass) sends extra passes below the
+  horizon, so the stable bake is used instead. Visually the glow, dust and
+  stars still read as separate layers.
+- The menu shows which lunar event is tonight, so the second moon is easy to
+  verify. Everything stays client-side and is not synced with the host.
 
 ## What's new in 1.5.4
 
@@ -81,6 +103,7 @@ Press **NumPad6** or **F8** in game:
 - **Host lock** (host only): same night for all players;
 - darkness strength slider, 2–60% (default 6%);
 - brighter indoors, cold night tint, moon phases;
+- night sky: Milky Way, sky brightness, second moon (every night, brighter on events);
 - "Night now (30 s)" — instant preview;
 - reset to defaults.
 
@@ -89,7 +112,8 @@ follows the game language: English by default, Russian when the game runs in
 Russian.
 
 Config keys: `enabled`, `night`, `indoor`, `tint`, `moon`, `weather`, `eyes`,
-`light`, `nvg`, `biome`, `biome_amount`, `lunar`, `force`.
+`light`, `nvg`, `biome`, `biome_amount`, `lunar`, `force`, `sky`, `sky_amt`,
+`sky_moon`, `sky_mesh`.
 
 ## Install
 
@@ -133,12 +157,14 @@ cd Source
 
 ## AI disclosure
 
-Code and documentation were created with AI assistance. No AI-generated visual
-assets, models, voices or textures are included.
+Code and documentation were created with AI assistance. The Milky Way cubemap
+and the star field are generated procedurally by `Tools/bake_sky_procedural.py`.
+The optional second-moon texture is an AI-generated image (PixAI); no other
+AI-generated visual assets, models or voices are included.
 
 ---
 
-# DifRUST — Rust Nights 1.5.4 (RU)
+# DifRUST — Rust Nights 1.7.0 (RU)
 
 Клиентский мод освещения для 7 Days to Die 3.4.x. Меняется только свет: туман,
 погода, зомби, лут, прокачка и сеть не затронуты.
@@ -151,6 +177,30 @@ assets, models, voices or textures are included.
 | 22:00–04:00 | полная тьма |
 | 04:00–06:00 | плавный рассвет |
 | 06:00–20:00 | обычный свет |
+
+## Что нового в 1.7.0
+
+- **Вторая луна, ванильная остаётся.** Своя золотая луна больше не подменяет
+  ванильную. Рядом идёт меньшая луна-спутник (58 %) по своей орбите — примерно
+  на 29° выше и 20° в стороне; видна **каждую ночь**, пока включён тумблер.
+  В обычную ночь она спокойная и чуть холоднее, в особую ночь LunarEvents
+  разгорается ярче и получает оттенок события (урожайная — золотая, дикая —
+  янтарная, фатальная — красная). Всегда полный золотой диск, а не текущая
+  фаза ванильной луны. Работает с LunarEvents и без него; включена по умолчанию.
+- **Пересобрано звёздное поле.** 223 000 звёзд на гранях 2048² вместо 42 000 на
+  1024²: реалистичное распределение величин (много слабых, единицы ярких),
+  цвета от голубовато-белых до оранжевых, сгущение к галактической плоскости
+  и провалы в тёмных прожилках пыли. В прицеле — чёткие точки.
+- **Слоистая запечка.** Фон глубокого космоса, сияние Млечного Пути и звёзды
+  генерируются отдельным контентом и запекаются в кубмапу 2048². Рантайм-вариант
+  с тремя подмешами на сфере атмосферы был собран, но отключён: композитор неба
+  в игре (`ZTest Always` + отдельный sky-проход) уводит дополнительные проходы
+  под горизонт, поэтому используется стабильная запечка. Визуально сияние,
+  пыль и звёзды всё равно читаются как отдельные слои.
+- **Луна чётче:** текстура второй луны теперь 1024² (исходная AI-пластина),
+  а не 512².
+- В меню видно, какая лунная ночь сегодня, чтобы вторую луну было легко
+  проверить. Всё остаётся клиентской косметикой и с хостом не синхронизируется.
 
 ## Что нового в 1.5.4
 
@@ -218,6 +268,7 @@ assets, models, voices or textures are included.
 - **Замок хоста** (только у хоста): одна ночь для всех игроков;
 - слайдер «Сила тьмы», 2–60% (по умолчанию 6%);
 - ярче в помещениях, холодный оттенок, фазы луны;
+- ночное небо: Млечный Путь, яркость неба, вторая луна (каждую ночь, ярче в события);
 - «Ночь сейчас (30 с)» — быстрый предпросмотр;
 - сброс к значениям по умолчанию.
 
@@ -226,7 +277,8 @@ assets, models, voices or textures are included.
 языке игры.
 
 Ключи конфига: `enabled`, `night`, `indoor`, `tint`, `moon`, `weather`, `eyes`,
-`light`, `nvg`, `biome`, `biome_amount`, `lunar`, `force`.
+`light`, `nvg`, `biome`, `biome_amount`, `lunar`, `force`, `sky`, `sky_amt`,
+`sky_moon`, `sky_mesh`.
 
 ## Установка
 
