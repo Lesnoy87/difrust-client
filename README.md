@@ -31,6 +31,8 @@ weather, zombies, loot, progression and network logic are untouched.
   (`ZTest Always` plus a separate sky pass) sends extra passes below the
   horizon, so the stable bake is used instead. Visually the glow, dust and
   stars still read as separate layers.
+- **Sharper moon:** the second-moon texture is now 1024² (the original AI
+  plate) instead of 512².
 - The menu shows which lunar event is tonight, so the second moon is easy to
   verify. Everything stays client-side and is not synced with the host.
 
@@ -147,8 +149,11 @@ Mods\DifRUST\Source\...
 
 ## Source
 
-Included in this archive (`Source/`). Public repository:
-https://github.com/Lesnoy87/difrust-client
+The C# source is included in this archive (`Source/`), and the same code is
+public on GitHub:
+
+- source: https://github.com/Lesnoy87/difrust-client/tree/main/Source
+- sky generator: https://github.com/Lesnoy87/difrust-client/blob/main/Tools/bake_sky_procedural.py
 
 ```powershell
 cd Source
